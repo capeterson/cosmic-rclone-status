@@ -1,0 +1,18 @@
+[package]
+name = "cosmic-rclone-status"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "COSMIC panel applet showing rclone mount and upload status"
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+ureq = { version = "2", features = ["json"] }
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+default-features = false
+features = ["applet", "dbus-config", "multi-window", "tokio", "wayland", "winit"]

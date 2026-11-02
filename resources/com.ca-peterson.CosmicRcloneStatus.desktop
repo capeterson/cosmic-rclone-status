@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=rclone Status
+Comment=Show rclone mount and upload status in the panel
+Type=Application
+Exec=cosmic-rclone-status
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;rclone;Drive;
+Icon=com.ca-peterson.CosmicRcloneStatus-symbolic
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto

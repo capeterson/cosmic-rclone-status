@@ -1,0 +1,19 @@
+# Rust / Cargo build output
+/target/
+
+# Editor and OS cruft
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Local secrets and environment (never commit rclone credentials)
+.env
+*.env
+*.log
+
+# Vendored deps / packaging output
+/vendor/
+/.cargo/
+vendor.tar
