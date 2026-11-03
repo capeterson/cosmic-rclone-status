@@ -197,6 +197,21 @@ impl Status {
         }
     }
 
+    /// Something is actually moving data right now.
+    pub fn active(&self) -> bool {
+        !self.transfers.is_empty() || self.uploads_in_progress > 0
+    }
+
+    /// The transfer speed to display. rclone reports a smoothed average that keeps decaying
+    /// toward zero long after the last transfer ends, so report zero when nothing is moving.
+    pub fn display_speed(&self) -> f64 {
+        if self.active() {
+            self.speed
+        } else {
+            0.0
+        }
+    }
+
     /// Files are queued or being sent to the remote.
     pub fn uploading(&self) -> bool {
         self.uploads_in_progress + self.uploads_queued > 0
@@ -480,6 +495,22 @@ mod tests {
     #[test]
     fn idle_is_synced() {
         assert_eq!(status().health(), Health::Synced);
+    }
+
+    #[test]
+    fn speed_is_zero_once_transfers_stop() {
+        let mut s = status();
+        s.speed = 123.0; // rclone's decaying average, still non-zero after the transfer ended
+        assert!((s.display_speed()).abs() < f64::EPSILON);
+        s.uploads_in_progress = 1;
+        assert!((s.display_speed() - 123.0).abs() < f64::EPSILON);
+        s.uploads_in_progress = 0;
+        s.transfers = transfers(1);
+        assert!((s.display_speed() - 123.0).abs() < f64::EPSILON);
+        // Queued but not started is not moving data yet.
+        s.transfers = vec![];
+        s.uploads_queued = 2;
+        assert!((s.display_speed()).abs() < f64::EPSILON);
     }
 
     #[test]

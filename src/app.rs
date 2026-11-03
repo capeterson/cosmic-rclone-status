@@ -148,7 +148,7 @@ fn detail_lines(st: &Status) -> Vec<String> {
         st.cache_files,
         human(st.cache_bytes as f64)
     ));
-    lines.push(format!("Speed: {}/s", human(st.speed)));
+    lines.push(format!("Speed: {}/s", human(st.display_speed())));
     if st.errored_files > 0 || st.out_of_space {
         lines.push(format!(
             "Errored files: {}{}",
