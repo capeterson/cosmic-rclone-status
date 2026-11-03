@@ -14,6 +14,10 @@ pub struct Config {
     pub service: String,
     /// Where the remote is mounted (`~` is expanded).
     pub mount_path: String,
+    /// rclone's `--cache-dir` (`~` is expanded); read for per-file cache status.
+    pub cache_dir: String,
+    /// Add an "Rclone…" entry to the COSMIC Files right-click menu.
+    pub context_menu: bool,
 }
 
 impl Default for Config {
@@ -23,6 +27,8 @@ impl Default for Config {
             env_file: "~/.config/rclone/gdrive-rc.env".into(),
             service: "rclone-gdrive.service".into(),
             mount_path: "~/GoogleDrive".into(),
+            cache_dir: "~/.cache/rclone".into(),
+            context_menu: true,
         }
     }
 }
