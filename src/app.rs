@@ -98,29 +98,44 @@ impl AppModel {
     }
 
     fn icon(&self) -> widget::icon::Handle {
-        let svg: &'static [u8] = match self.status.as_ref().map(Status::health) {
-            Some(Health::Synced) => include_bytes!("../resources/emblems/synced.svg"),
-            Some(Health::Uploading) => include_bytes!("../resources/emblems/uploading.svg"),
-            Some(Health::Downloading) => include_bytes!("../resources/emblems/downloading.svg"),
-            Some(Health::Transferring) => include_bytes!("../resources/emblems/transferring.svg"),
-            Some(Health::Error) => include_bytes!("../resources/emblems/error.svg"),
-            Some(Health::Down) => include_bytes!("../resources/emblems/down.svg"),
-            None => include_bytes!("../resources/emblems/loading.svg"),
-        };
+        let svg = self
+            .status
+            .as_ref()
+            .map_or(LOADING_SVG, |st| health_svg(st.health()));
         let mut handle = widget::icon::from_svg_bytes(svg);
         handle.symbolic = true;
         handle
     }
 }
 
+const LOADING_SVG: &[u8] = include_bytes!("../resources/emblems/loading.svg");
+
+/// The emblem for each health state.
+fn health_svg(h: Health) -> &'static [u8] {
+    match h {
+        Health::Healthy => include_bytes!("../resources/emblems/synced.svg"),
+        Health::Uploading => include_bytes!("../resources/emblems/uploading.svg"),
+        Health::Downloading => include_bytes!("../resources/emblems/downloading.svg"),
+        Health::Transferring => include_bytes!("../resources/emblems/transferring.svg"),
+        Health::FileErrors => include_bytes!("../resources/emblems/error.svg"),
+        Health::CacheFull => include_bytes!("../resources/emblems/full.svg"),
+        Health::Unreachable => include_bytes!("../resources/emblems/unreachable.svg"),
+        Health::NotMounted => include_bytes!("../resources/emblems/unmounted.svg"),
+        Health::ServiceStopped => include_bytes!("../resources/emblems/stopped.svg"),
+    }
+}
+
 fn headline(health: Option<Health>) -> &'static str {
     match health {
-        Some(Health::Synced) => "Synced",
+        Some(Health::Healthy) => "Healthy",
         Some(Health::Uploading) => "Uploading",
         Some(Health::Downloading) => "Downloading",
         Some(Health::Transferring) => "Uploading and downloading",
-        Some(Health::Error) => "Error",
-        Some(Health::Down) => "Mount is down",
+        Some(Health::FileErrors) => "Some files failed",
+        Some(Health::CacheFull) => "Cache is full",
+        Some(Health::Unreachable) => "Can't reach rclone",
+        Some(Health::NotMounted) => "Not mounted",
+        Some(Health::ServiceStopped) => "Service stopped",
         None => "Checking…",
     }
 }
@@ -148,7 +163,6 @@ fn detail_lines(st: &Status) -> Vec<String> {
         st.cache_files,
         human(st.cache_bytes as f64)
     ));
-    lines.push(format!("Speed: {}/s", human(st.display_speed())));
     if st.errored_files > 0 || st.out_of_space {
         lines.push(format!(
             "Errored files: {}{}",
@@ -284,17 +298,41 @@ impl AppModel {
             .spacing(8)
             .padding(12)
             .width(Length::Fill);
-        col = col.push(widget::text::heading(headline(
-            self.status.as_ref().map(Status::health),
-        )));
-
+        let health = self.status.as_ref().map(Status::health);
+        let title = widget::Row::new()
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .push(emblem(health.map_or(LOADING_SVG, health_svg)))
+            .push(widget::text::heading(headline(health)));
+        // The details live in a tooltip to keep the popup compact.
         if let Some(st) = &self.status {
+            let mut tip = widget::Column::new().spacing(2);
             for line in detail_lines(st) {
-                col = col.push(widget::text::body(line));
+                tip = tip.push(widget::text::body(line));
             }
             if let Some(e) = &st.last_error {
-                col = col.push(widget::text::caption(format!("Last error: {e}")));
+                tip = tip.push(widget::text::caption(format!("Last error: {e}")));
             }
+            let mut header = widget::Row::new()
+                .align_y(Alignment::Center)
+                .push(widget::tooltip(
+                    title,
+                    tip,
+                    widget::tooltip::Position::Bottom,
+                ));
+            // Speed sits beside the status, and only while data is moving.
+            let speed = st.display_speed();
+            if speed > 0.0 {
+                header = header
+                    .push(widget::Space::new().width(Length::Fill))
+                    .push(widget::text::body(format!("{}/s", human(speed))));
+            }
+            col = col.push(header);
+        } else {
+            col = col.push(title);
+        }
+
+        if let Some(st) = &self.status {
             if !st.transfers.is_empty() {
                 col = col.push(widget::divider::horizontal::default());
                 for t in st.transfers.iter().take(8) {
@@ -550,8 +588,9 @@ mod tests {
     #[test]
     fn headline_covers_every_state() {
         assert_eq!(headline(None), "Checking…");
-        assert_eq!(headline(Some(Health::Synced)), "Synced");
-        assert_eq!(headline(Some(Health::Down)), "Mount is down");
+        assert_eq!(headline(Some(Health::Healthy)), "Healthy");
+        assert_eq!(headline(Some(Health::NotMounted)), "Not mounted");
+        assert_eq!(headline(Some(Health::ServiceStopped)), "Service stopped");
         assert_eq!(
             headline(Some(Health::Transferring)),
             "Uploading and downloading"
@@ -563,7 +602,7 @@ mod tests {
         let l = detail_lines(&status());
         assert_eq!(l[0], "Mount: up   Service: running");
         assert_eq!(l[1], "Uploads: 0 in progress, 0 queued");
-        assert_eq!(l.len(), 4, "no error lines when healthy: {l:?}");
+        assert_eq!(l.len(), 3, "no error lines when healthy: {l:?}");
     }
 
     #[test]

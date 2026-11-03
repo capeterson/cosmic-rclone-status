@@ -152,15 +152,22 @@ fn history(raw: Vec<RawTransferred>, cap: usize) -> Vec<CompletedTransfer> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
-    /// Service stopped or folder not mounted.
-    Down,
-    /// Running, but the rc API is unreachable or rclone reports errors.
-    Error,
+    /// The systemd unit is not running.
+    ServiceStopped,
+    /// The service runs but the folder is not mounted.
+    NotMounted,
+    /// Mounted, but the rc API cannot be reached.
+    Unreachable,
+    /// The VFS cache has no room left.
+    CacheFull,
+    /// rclone reports files that failed to transfer.
+    FileErrors,
     Uploading,
     Downloading,
     /// Uploading and downloading at the same time.
     Transferring,
-    Synced,
+    /// Service running, folder mounted, nothing wrong, nothing moving.
+    Healthy,
 }
 
 #[derive(Debug, Clone)]
@@ -183,16 +190,22 @@ pub struct Status {
 
 impl Status {
     pub fn health(&self) -> Health {
-        if !self.service_active || !self.mounted {
-            Health::Down
-        } else if self.rc_error.is_some() || self.errored_files > 0 || self.out_of_space {
-            Health::Error
+        if !self.service_active {
+            Health::ServiceStopped
+        } else if !self.mounted {
+            Health::NotMounted
+        } else if self.rc_error.is_some() {
+            Health::Unreachable
+        } else if self.out_of_space {
+            Health::CacheFull
+        } else if self.errored_files > 0 {
+            Health::FileErrors
         } else {
             match (self.uploading(), self.downloading()) {
                 (true, true) => Health::Transferring,
                 (true, false) => Health::Uploading,
                 (false, true) => Health::Downloading,
-                (false, false) => Health::Synced,
+                (false, false) => Health::Healthy,
             }
         }
     }
@@ -537,8 +550,8 @@ mod tests {
     // ---- Status::health -------------------------------------------------
 
     #[test]
-    fn idle_is_synced() {
-        assert_eq!(status().health(), Health::Synced);
+    fn idle_is_healthy() {
+        assert_eq!(status().health(), Health::Healthy);
     }
 
     #[test]
@@ -562,23 +575,33 @@ mod tests {
         let mut s = status();
         s.errored_files = 3;
         s.service_active = false;
-        assert_eq!(s.health(), Health::Down);
+        assert_eq!(s.health(), Health::ServiceStopped);
         s.service_active = true;
         s.mounted = false;
-        assert_eq!(s.health(), Health::Down);
+        assert_eq!(s.health(), Health::NotMounted);
     }
 
     #[test]
-    fn each_error_signal_alone_is_error() {
+    fn each_error_signal_alone_has_its_own_state() {
         let mut s = status();
         s.rc_error = Some("boom".into());
-        assert_eq!(s.health(), Health::Error);
+        assert_eq!(s.health(), Health::Unreachable);
         let mut s = status();
         s.errored_files = 1;
-        assert_eq!(s.health(), Health::Error);
+        assert_eq!(s.health(), Health::FileErrors);
         let mut s = status();
         s.out_of_space = true;
-        assert_eq!(s.health(), Health::Error);
+        assert_eq!(s.health(), Health::CacheFull);
+    }
+
+    #[test]
+    fn error_priority_is_unreachable_then_full_then_file_errors() {
+        let mut s = status();
+        s.errored_files = 1;
+        s.out_of_space = true;
+        assert_eq!(s.health(), Health::CacheFull);
+        s.rc_error = Some("boom".into());
+        assert_eq!(s.health(), Health::Unreachable);
     }
 
     #[test]
@@ -586,7 +609,7 @@ mod tests {
         let mut s = status();
         s.uploads_queued = 2;
         s.out_of_space = true;
-        assert_eq!(s.health(), Health::Error);
+        assert_eq!(s.health(), Health::CacheFull);
     }
 
     // ---- direction heuristic -------------------------------------------
@@ -827,7 +850,7 @@ other: /home/u/Other fuse.sshfs rw 0 0
         ]);
         let st = assemble(true, true, Some(fetch_rc(&addr, None, T)));
         assert!(st.rc_error.is_some());
-        assert_eq!(st.health(), Health::Error);
+        assert_eq!(st.health(), Health::Unreachable);
         h.join().unwrap();
     }
 
@@ -861,7 +884,7 @@ other: /home/u/Other fuse.sshfs rw 0 0
         let st = assemble(true, true, Some(fetch_rc(&addr, None, T)));
         assert!(st.rc_error.is_none());
         assert_eq!(st.recent.len(), 0);
-        assert_eq!(st.health(), Health::Synced);
+        assert_eq!(st.health(), Health::Healthy);
         h.join().unwrap();
     }
 
@@ -1055,7 +1078,7 @@ other: /home/u/Other fuse.sshfs rw 0 0
     fn assemble_without_rc_leaves_defaults() {
         let st = assemble(false, false, None);
         assert!(st.rc_error.is_none());
-        assert_eq!(st.health(), Health::Down);
+        assert_eq!(st.health(), Health::ServiceStopped);
     }
 
     // ---- rc_request and mount_fs ----
