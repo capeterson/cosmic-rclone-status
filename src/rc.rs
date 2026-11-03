@@ -345,16 +345,62 @@ fn rc_call<T: for<'de> Deserialize<'de>>(
     auth: Option<&str>,
     method: &str,
 ) -> Result<T, String> {
+    rc_post(agent, addr, auth, method, "{}")
+}
+
+fn rc_post<T: for<'de> Deserialize<'de>>(
+    agent: &ureq::Agent,
+    addr: &str,
+    auth: Option<&str>,
+    method: &str,
+    body: &str,
+) -> Result<T, String> {
     let mut req = agent
         .post(&format!("http://{addr}/{method}"))
         .set("Content-Type", "application/json");
     if let Some(a) = auth {
         req = req.set("Authorization", a);
     }
-    req.send_string("{}")
+    req.send_string(body)
         .map_err(|e| e.to_string())?
         .into_json()
         .map_err(|e| e.to_string())
+}
+
+/// Call an rc method with a JSON body and return the JSON reply.
+pub fn rc_request(
+    cfg: &Config,
+    method: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(10))
+        .build();
+    let auth = auth_header(&cfg.env_file);
+    rc_post(
+        &agent,
+        &cfg.rc_addr,
+        auth.as_deref(),
+        method,
+        &body.to_string(),
+    )
+}
+
+/// The rclone remote (e.g. `gdrive:`) mounted at `want`, from `/proc/mounts`-formatted text.
+fn parse_mount_fs(mounts: &str, want: &str) -> Option<String> {
+    let want = want.trim_end_matches('/');
+    mounts.lines().find_map(|l| {
+        let mut f = l.split_whitespace();
+        let (fs, mp, fstype) = (f.next()?, f.next()?, f.next()?);
+        (fstype == "fuse.rclone" && unescape_mount(mp).trim_end_matches('/') == want)
+            .then(|| unescape_mount(fs))
+    })
+}
+
+/// Which rclone remote is mounted at `mount_path`.
+pub fn mount_fs(mount_path: &str) -> Option<String> {
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    parse_mount_fs(&mounts, &expand(mount_path))
 }
 
 /// What the rc API told us: `core/stats`, `vfs/stats` and `core/transferred`.
@@ -447,27 +493,25 @@ pub fn open_mount(cfg: &Config) {
         .spawn();
 }
 
-/// The mount-side folder holding the remote path `name`. Falls back to the mount root for
-/// top-level files and for paths that try to climb out with `..`.
-fn containing_dir(mount_path: &str, name: &str) -> String {
+/// Where the remote path `name` appears in the mount, or `None` for paths that try to climb out
+/// of it with `..`.
+fn item_path(mount_path: &str, name: &str) -> Option<String> {
     let mount = expand(mount_path);
-    let mount = if mount.len() > 1 {
-        mount.trim_end_matches('/').to_string()
-    } else {
-        mount
-    };
-    match name.trim_end_matches('/').rsplit_once('/') {
-        Some((dir, _)) if !dir.split('/').any(|c| c == "..") => format!("{mount}/{dir}"),
-        _ => mount,
+    let mount = mount.trim_end_matches('/');
+    let name = name.trim_matches('/');
+    if name.is_empty() || name.split('/').any(|c| c == "..") {
+        return None;
     }
+    Some(format!("{mount}/{name}"))
 }
 
-/// Open the folder that contains `name` in the file manager. Opening the folder (not the
-/// file) never triggers a download.
-pub fn open_containing(cfg: &Config, name: &str) {
-    let _ = Command::new("xdg-open")
-        .arg(containing_dir(&cfg.mount_path, name))
-        .spawn();
+/// Open the "Rclone…" details window for the remote path `name`, as a separate process (the
+/// same window COSMIC Files' right-click entry opens). Nothing is downloaded.
+pub fn open_details(cfg: &Config, name: &str) {
+    let (Some(path), Ok(exe)) = (item_path(&cfg.mount_path, name), std::env::current_exe()) else {
+        return;
+    };
+    let _ = Command::new(exe).arg("--menu").arg(path).spawn();
 }
 
 pub fn human(n: f64) -> String {
@@ -981,23 +1025,30 @@ other: /home/u/Other fuse.sshfs rw 0 0
         );
     }
 
-    // ---- containing folder ----------------------------------------------
+    // ---- item path -------------------------------------------------------
 
     #[test]
-    fn containing_dir_is_the_files_parent_in_the_mount() {
+    fn item_path_is_the_name_inside_the_mount() {
         assert_eq!(
-            containing_dir("/mnt/gd", "Docs/Sub/a.txt"),
-            "/mnt/gd/Docs/Sub"
+            item_path("/mnt/gd", "Docs/Sub/a.txt").as_deref(),
+            Some("/mnt/gd/Docs/Sub/a.txt")
         );
-        assert_eq!(containing_dir("/mnt/gd/", "Docs/a.txt"), "/mnt/gd/Docs");
-        assert_eq!(containing_dir("/mnt/gd", "top.txt"), "/mnt/gd");
-        assert_eq!(containing_dir("/", "top.txt"), "/");
+        assert_eq!(
+            item_path("/mnt/gd/", "top.txt").as_deref(),
+            Some("/mnt/gd/top.txt")
+        );
+        assert_eq!(item_path("/", "top.txt").as_deref(), Some("/top.txt"));
+        assert_eq!(
+            item_path("/mnt/gd", "Docs/").as_deref(),
+            Some("/mnt/gd/Docs")
+        );
     }
 
     #[test]
-    fn containing_dir_refuses_to_climb_out() {
-        assert_eq!(containing_dir("/mnt/gd", "../etc/passwd"), "/mnt/gd");
-        assert_eq!(containing_dir("/mnt/gd", "a/../../b/c"), "/mnt/gd");
+    fn item_path_refuses_to_climb_out_or_be_empty() {
+        assert_eq!(item_path("/mnt/gd", "../etc/passwd"), None);
+        assert_eq!(item_path("/mnt/gd", "a/../../b/c"), None);
+        assert_eq!(item_path("/mnt/gd", ""), None);
     }
 
     #[test]
@@ -1005,5 +1056,92 @@ other: /home/u/Other fuse.sshfs rw 0 0
         let st = assemble(false, false, None);
         assert!(st.rc_error.is_none());
         assert_eq!(st.health(), Health::Down);
+    }
+
+    // ---- rc_request and mount_fs ----
+
+    use crate::testutil::{ok, status as http_status, FakeServer};
+
+    fn cfg_for(s: &FakeServer) -> Config {
+        Config {
+            rc_addr: s.addr.clone(),
+            env_file: "/nonexistent/rc.env".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn rc_request_posts_the_json_body_and_returns_the_reply() {
+        let s = FakeServer::start(vec![ok("/vfs/refresh", r#"{"result":{"a/":"OK"}}"#)]);
+        let body = serde_json::json!({"dir": "a", "recursive": "false"});
+        let reply = rc_request(&cfg_for(&s), "vfs/refresh", &body).unwrap();
+        assert_eq!(reply["result"]["a/"], "OK");
+        let req = &s.requests()[0];
+        assert_eq!(req.path(), "/vfs/refresh");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&req.body).unwrap(),
+            body
+        );
+        assert_eq!(req.authorization, None);
+    }
+
+    #[test]
+    fn rc_request_sends_basic_auth_from_the_env_file() {
+        let dir = std::env::temp_dir().join(format!("rcs-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = dir.join("rc.env");
+        std::fs::write(&env, "RCLONE_RC_USER=u\nRCLONE_RC_PASS=p\n").unwrap();
+        let s = FakeServer::start(vec![ok("/x", "{}")]);
+        let cfg = Config {
+            env_file: env.to_string_lossy().into_owned(),
+            ..cfg_for(&s)
+        };
+        rc_request(&cfg, "x", &serde_json::json!({})).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(s.requests()[0].authorization.as_deref(), Some("Basic dTpw"));
+    }
+
+    #[test]
+    fn rc_request_reports_http_errors_and_unreachable_servers() {
+        let s = FakeServer::start(vec![http_status("/boom", 500)]);
+        assert!(rc_request(&cfg_for(&s), "boom", &serde_json::json!({})).is_err());
+        assert!(rc_request(&cfg_for(&s), "missing", &serde_json::json!({})).is_err());
+        let down = Config {
+            rc_addr: "127.0.0.1:1".into(),
+            ..cfg_for(&s)
+        };
+        assert!(rc_request(&down, "x", &serde_json::json!({})).is_err());
+    }
+
+    const FS_MOUNTS: &str = "\
+proc /proc proc rw 0 0
+gdrive: /home/u/GoogleDrive fuse.rclone rw,nosuid 0 0
+work:sub/dir /home/u/My\\040Work fuse.rclone rw 0 0
+/dev/sda1 /home/u/Other ext4 rw 0 0
+";
+
+    #[test]
+    fn parse_mount_fs_finds_the_remote_for_a_mount_point() {
+        assert_eq!(
+            parse_mount_fs(FS_MOUNTS, "/home/u/GoogleDrive").as_deref(),
+            Some("gdrive:")
+        );
+        assert_eq!(
+            parse_mount_fs(FS_MOUNTS, "/home/u/GoogleDrive/").as_deref(),
+            Some("gdrive:")
+        );
+        // Escaped spaces and sub-path remotes.
+        assert_eq!(
+            parse_mount_fs(FS_MOUNTS, "/home/u/My Work").as_deref(),
+            Some("work:sub/dir")
+        );
+    }
+
+    #[test]
+    fn parse_mount_fs_ignores_other_filesystems_and_unknown_paths() {
+        assert_eq!(parse_mount_fs(FS_MOUNTS, "/home/u/Other"), None);
+        assert_eq!(parse_mount_fs(FS_MOUNTS, "/home/u/Missing"), None);
+        assert_eq!(parse_mount_fs("", "/x"), None);
+        assert_eq!(parse_mount_fs("garbage", "/x"), None);
     }
 }

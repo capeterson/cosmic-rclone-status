@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Two clockwise arcs, each ending in an arrowhead that points at the start of the other. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">
+  <g fill="none" stroke="#bebebe" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M55.29 6.64A42 42 0 0 1 55.29 89.36"/>
+    <path d="M64.21 93.88L55.29 89.36L62.13 82.06"/>
+    <path d="M40.71 89.36A42 42 0 0 1 40.71 6.64"/>
+    <path d="M31.79 2.12L40.71 6.64L33.87 13.94"/>
+  </g>
+</svg>

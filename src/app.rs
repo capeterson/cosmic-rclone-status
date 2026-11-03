@@ -53,8 +53,8 @@ pub enum Message {
     ServiceAction(&'static str),
     ActionDone,
     OpenFolder,
-    /// Open the folder that holds this remote path.
-    OpenContaining(String),
+    /// Open the details window for this remote path.
+    OpenDetails(String),
     ShowHistory,
     ShowMain,
     /// The debounce delay elapsed: show the newest history.
@@ -270,7 +270,7 @@ fn recent_row(t: &CompletedTransfer, now: jiff::Timestamp, detailed: bool) -> El
         row = row.push(emblem(include_bytes!("../resources/emblems/error.svg")));
     }
     widget::button::custom(row)
-        .on_press(Message::OpenContaining(t.name.clone()))
+        .on_press(Message::OpenDetails(t.name.clone()))
         .class(cosmic::theme::Button::MenuItem)
         .width(Length::Fill)
         .padding([4, 8])
@@ -405,6 +405,9 @@ impl cosmic::Application for AppModel {
 
     fn init(core: cosmic::Core, _flags: ()) -> (Self, Task<cosmic::Action<Message>>) {
         let config = Config::load(Self::APP_ID);
+        if config.context_menu {
+            crate::context_menu::install();
+        }
         let mut app = AppModel {
             core,
             config,
@@ -464,7 +467,7 @@ impl cosmic::Application for AppModel {
             }
             Message::ShowHistory => self.page = Page::History,
             Message::ShowMain => self.page = Page::Main,
-            Message::OpenContaining(name) => rc::open_containing(&self.config, &name),
+            Message::OpenDetails(name) => rc::open_details(&self.config, &name),
             Message::FetchFailed => self.fetching = false,
             // Don't clear `fetching`: a poll may still be in flight, and stacking a second
             // request is what the flag prevents. The next tick picks up any change.
