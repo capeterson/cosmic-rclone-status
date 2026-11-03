@@ -29,6 +29,7 @@ install-user: build-release
     install -Dm0644 resources/icons/hicolor/scalable/apps/{{appid}}-symbolic.svg ~/.local/share/icons/hicolor/scalable/apps/{{appid}}-symbolic.svg
 
 uninstall-user:
+    if [ -x ~/.local/bin/{{name}} ]; then ~/.local/bin/{{name}} --offline-remove; fi
     rm -f ~/.local/bin/{{name}} ~/.local/share/applications/{{appid}}.desktop ~/.local/share/icons/hicolor/scalable/apps/{{appid}}-symbolic.svg
 
 devid := 'com.ca-peterson.CosmicRcloneStatusDev'
@@ -43,4 +44,5 @@ install-dev:
     cargo build --release  # restore the normal build in target/
 
 uninstall-dev:
+    if [ -x ~/.local/bin/{{name}}-dev ]; then ~/.local/bin/{{name}}-dev --offline-remove; fi
     rm -f ~/.local/bin/{{name}}-dev ~/.local/share/applications/{{devid}}.desktop

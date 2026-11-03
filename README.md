@@ -29,6 +29,56 @@ Defaults (stored in cosmic-config under `com.ca-peterson.CosmicRcloneStatus`):
 | `mount_path` | `~/GoogleDrive` |
 | `cache_dir` | `~/.cache/rclone` (rclone's `--cache-dir`; read for per-file cache status) |
 | `context_menu` | `true` (add the "Rclone…" entry to COSMIC Files' right-click menu) |
+| `offline_enabled` | `false` (offline folders; switch on in Settings) |
+| `pins` | `[]` (folders kept offline, relative to the mount) |
+| `sync_interval_secs` | `300` (how often offline folders sync when nothing changes locally) |
+
+The settings window (`--settings`, or the gear in the popup) covers offline folders and the
+right-click menu entry.
+
+## Offline folders
+
+Like Google Drive's "Available offline": a pinned folder is fully downloaded, kept in sync both
+ways, and works with no connection, right where it is in the Drive folder. Turn it on in
+Settings, then right-click a folder in COSMIC Files → **Rclone…** → **Keep offline**.
+
+How it works:
+
+- The folder's local copy lives in `~/.local/share/cosmic-rclone-status/offline/<id>` and is
+  synced with `rclone bisync`, run *inside the mount's own rclone process* through its rc API
+  (`sync/bisync`), so there is no second rclone config or login. A background user service
+  (`cosmic-rclone-status-offline.service`) runs each sync: every `sync_interval_secs`, and about
+  10 seconds after a local change.
+- The local copy is mounted on top of the folder's place in the Drive folder
+  (`cosmic-rclone-status-pin@<id>.service`), so it shows up in place. Both services are bound to
+  the mount's service and start and stop with it; a folder that has been downloaded is mounted
+  even when offline.
+- Conflicts (the same file changed on both sides between syncs) are resolved as *newer wins*:
+  the older edit is uploaded first, so it stays in the file's version history in Google Drive
+  ("Manage versions"; Drive keeps old versions of uploaded files for about 30 days or 100
+  versions unless one is marked "Keep forever"). You get a notification.
+- Native Google Docs, Sheets and Slides are left out of the offline copy (rclone can only
+  download exports of them, which can't be synced back); they still open from the main mount.
+- If bisync stops for safety (too many deletions, or the folder vanished in the cloud), the
+  folder is marked **Needs attention**; **Repair** in Settings merges both sides without deleting
+  anything.
+- Unpinning uploads the last changes first (it waits if you're offline), then unmounts and deletes
+  the local copy.
+
+Setup, done from Settings: mounting inside the Drive mount needs the Drive mount to use
+`--allow-other`, which ordinary users can only request once `user_allow_other` is set in
+`/etc/fuse.conf` (one line, added through the system password prompt). The app then adds a
+drop-in for the mount's service (`<service>.d/50-cosmic-rclone-status.conf`) that sets
+`--allow-other` together with `--default-permissions` and a `077` umask, so other users still
+can't open your files, and restarts the mount once. Turning offline folders off removes the
+services and the drop-in; the `/etc/fuse.conf` line is left in place.
+
+Limits: folders only (not single files), and not nested inside each other; moving a file into or
+out of an offline folder is a copy plus a delete (it crosses mounts); very long folder paths are
+refused because rclone 1.60's bisync can't name its working files.
+
+Command line: `--pin PATH`, `--unpin PATH`, `--pins`, `--offline-repair FOLDER`, and
+`--offline-remove` (used by `just uninstall-user`; refuses while folders are pinned).
 
 ## Rclone details window
 

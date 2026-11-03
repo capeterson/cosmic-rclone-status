@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::mime_icon;
+use crate::pin::{self, OfflineState};
 use crate::rc::{self, human, CompletedTransfer, Direction, Health, Status};
 use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
@@ -39,6 +40,8 @@ pub struct AppModel {
     shown: Vec<CompletedTransfer>,
     /// A `HistoryDebounced` message is already scheduled.
     history_pending: bool,
+    /// What the offline-folder keeper last reported.
+    offline: OfflineState,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +62,8 @@ pub enum Message {
     ShowMain,
     /// The debounce delay elapsed: show the newest history.
     HistoryDebounced,
+    OfflineLoaded(OfflineState),
+    OpenSettings,
 }
 
 impl AppModel {
@@ -68,13 +73,21 @@ impl AppModel {
         }
         self.fetching = true;
         let cfg = self.config.clone();
-        Task::perform(
+        let status = Task::perform(
             async move { tokio::task::spawn_blocking(move || rc::fetch(&cfg)).await },
             |res| match res {
                 Ok(st) => cosmic::Action::App(Message::StatusUpdated(st)),
                 Err(_) => cosmic::Action::App(Message::FetchFailed),
             },
-        )
+        );
+        if !self.config.offline_enabled {
+            return status;
+        }
+        let offline = Task::perform(
+            async { tokio::task::spawn_blocking(OfflineState::load).await },
+            |res| cosmic::Action::App(Message::OfflineLoaded(res.unwrap_or_default())),
+        );
+        Task::batch([status, offline])
     }
 
     /// Decide when the displayed history catches up with the latest status. The first fill is
@@ -177,6 +190,15 @@ fn detail_lines(st: &Status) -> Vec<String> {
     lines
 }
 
+/// "Offline: 2 folders · all available offline", or a nudge to finish setup.
+fn offline_line(pins: &[String], state: &OfflineState) -> String {
+    if state.updated == 0 {
+        "Offline folders: finish setup in Settings".to_string()
+    } else {
+        format!("Offline: {}", pin::summary(pins, state))
+    }
+}
+
 /// One line describing a transfer. `size` is negative when rclone doesn't know it.
 fn transfer_line(t: &rc::Transfer) -> String {
     let total = if t.size < 0 {
@@ -194,7 +216,7 @@ fn transfer_line(t: &rc::Transfer) -> String {
 }
 
 /// "just now", "5m ago", "3h ago", "2d ago". Empty when the time is unknown.
-fn ago(now: jiff::Timestamp, then: Option<jiff::Timestamp>) -> String {
+pub(crate) fn ago(now: jiff::Timestamp, then: Option<jiff::Timestamp>) -> String {
     let Some(then) = then else {
         return String::new();
     };
@@ -293,6 +315,21 @@ fn recent_row(t: &CompletedTransfer, now: jiff::Timestamp, detailed: bool) -> El
 
 impl AppModel {
     /// The default popup page: status, active transfers, recent files, actions.
+    /// One line on offline folders, when they're switched on.
+    fn offline_row(&self) -> Option<Element<'_, Message>> {
+        self.config.offline_enabled.then(|| {
+            widget::Row::new()
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .push(widget::icon::from_name("folder-download-symbolic").size(16))
+                .push(widget::text::caption(offline_line(
+                    &self.config.pins,
+                    &self.offline,
+                )))
+                .into()
+        })
+    }
+
     fn main_page(&self) -> Element<'_, Message> {
         let mut col = widget::Column::new()
             .spacing(8)
@@ -330,6 +367,10 @@ impl AppModel {
             col = col.push(header);
         } else {
             col = col.push(title);
+        }
+
+        if let Some(row) = self.offline_row() {
+            col = col.push(row);
         }
 
         if let Some(st) = &self.status {
@@ -384,7 +425,14 @@ impl AppModel {
             .push(
                 widget::button::destructive("Stop")
                     .on_press_maybe(running.then_some(Message::ServiceAction("stop"))),
-            );
+            )
+            .push(widget::Space::new().width(Length::Fill))
+            .push(widget::tooltip(
+                widget::button::icon(widget::icon::from_name("emblem-system-symbolic"))
+                    .on_press(Message::OpenSettings),
+                widget::text::body("Settings"),
+                widget::tooltip::Position::Top,
+            ));
         col.push(widget::divider::horizontal::default())
             .push(actions)
             .into()
@@ -511,6 +559,15 @@ impl cosmic::Application for AppModel {
             // request is what the flag prevents. The next tick picks up any change.
             Message::Tick | Message::ActionDone => return self.refresh(),
             Message::OpenFolder => rc::open_mount(&self.config),
+            Message::OfflineLoaded(s) => self.offline = s,
+            Message::OpenSettings => {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).arg("--settings").spawn();
+                }
+                if let Some(p) = self.popup.take() {
+                    return destroy_popup(p);
+                }
+            }
             Message::ServiceAction(verb) => {
                 let cfg = self.config.clone();
                 return Task::perform(

@@ -270,7 +270,7 @@ struct DiskCache {
     uploads_queued: u64,
 }
 
-fn service_active(service: &str) -> bool {
+pub fn service_active(service: &str) -> bool {
     Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", service])
         .status()
@@ -311,7 +311,7 @@ fn parse_mounts(mounts: &str, want: &str) -> bool {
     })
 }
 
-fn is_mounted(mount_path: &str) -> bool {
+pub fn is_mounted(mount_path: &str) -> bool {
     std::fs::read_to_string("/proc/mounts").is_ok_and(|m| parse_mounts(&m, &expand(mount_path)))
 }
 
@@ -374,10 +374,22 @@ fn rc_post<T: for<'de> Deserialize<'de>>(
     if let Some(a) = auth {
         req = req.set("Authorization", a);
     }
-    req.send_string(body)
-        .map_err(|e| e.to_string())?
-        .into_json()
-        .map_err(|e| e.to_string())
+    match req.send_string(body) {
+        Ok(resp) => resp.into_json().map_err(|e| e.to_string()),
+        // rclone puts the reason in the JSON body of an error reply; keep it.
+        Err(ureq::Error::Status(code, resp)) => {
+            let reason = resp
+                .into_json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v.get("error")?.as_str().map(str::to_string))
+                .filter(|e| !e.is_empty());
+            Err(match reason {
+                Some(r) => format!("status code {code}: {r}"),
+                None => format!("status code {code}"),
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Call an rc method with a JSON body and return the JSON reply.
@@ -408,6 +420,26 @@ fn parse_mount_fs(mounts: &str, want: &str) -> Option<String> {
         (fstype == "fuse.rclone" && unescape_mount(mp).trim_end_matches('/') == want)
             .then(|| unescape_mount(fs))
     })
+}
+
+/// The mount options (e.g. `rw,nosuid,user_id=1000,allow_other`) of the rclone mount at `want`.
+fn parse_mount_options(mounts: &str, want: &str) -> Option<String> {
+    let want = want.trim_end_matches('/');
+    mounts.lines().find_map(|l| {
+        let mut f = l.split_whitespace();
+        let (_, mp, fstype, opts) = (f.next()?, f.next()?, f.next()?, f.next()?);
+        (fstype == "fuse.rclone" && unescape_mount(mp).trim_end_matches('/') == want)
+            .then(|| opts.to_string())
+    })
+}
+
+/// Does the rclone mount at `mount_path` let other processes in (`--allow-other`)? Needed for
+/// offline folders, which are mounted inside it.
+pub fn mount_allows_other(mount_path: &str) -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .ok()
+        .and_then(|m| parse_mount_options(&m, &expand(mount_path)))
+        .is_some_and(|o| o.split(',').any(|x| x == "allow_other"))
 }
 
 /// Which rclone remote is mounted at `mount_path`.
@@ -1158,6 +1190,30 @@ work:sub/dir /home/u/My\\040Work fuse.rclone rw 0 0
             parse_mount_fs(FS_MOUNTS, "/home/u/My Work").as_deref(),
             Some("work:sub/dir")
         );
+    }
+
+    #[test]
+    fn mount_options_show_whether_other_processes_may_enter() {
+        let m = "gdrive: /home/u/D fuse.rclone rw,nosuid,user_id=1000,allow_other 0 0\n\
+                 x: /home/u/E fuse.rclone rw,nosuid,user_id=1000 0 0\n";
+        let allows =
+            |p| parse_mount_options(m, p).is_some_and(|o| o.split(',').any(|x| x == "allow_other"));
+        assert!(allows("/home/u/D"));
+        assert!(!allows("/home/u/E"));
+        assert_eq!(parse_mount_options(m, "/nope"), None);
+    }
+
+    #[test]
+    fn rc_errors_keep_rclones_reason() {
+        let (addr, h) = serve(vec![(
+            "500 Internal Server Error",
+            r#"{"error":"directory not found","status":500}"#.into(),
+        )]);
+        let agent = ureq::AgentBuilder::new().timeout(T).build();
+        let err =
+            rc_post::<serde_json::Value>(&agent, &addr, None, "sync/bisync", "{}").unwrap_err();
+        assert_eq!(err, "status code 500: directory not found");
+        h.join().unwrap();
     }
 
     #[test]
