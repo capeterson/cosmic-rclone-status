@@ -7,7 +7,16 @@ build-release:
     cargo build --release
 
 check:
-    cargo clippy -- -W clippy::pedantic
+    cargo clippy --all-targets --locked -- -D warnings
+
+test:
+    cargo test --locked
+
+# Everything CI runs
+ci:
+    cargo fmt --check
+    cargo clippy --all-targets --locked -- -D warnings
+    cargo test --locked
 
 # Print one status snapshot without the panel
 status:

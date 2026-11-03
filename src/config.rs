@@ -27,10 +27,58 @@ impl Default for Config {
     }
 }
 
-/// Expand a leading `~/` using `$HOME`.
+impl Config {
+    /// Load the user's saved settings, falling back to defaults for anything unreadable.
+    pub fn load(app_id: &str) -> Self {
+        cosmic_config::Config::new(app_id, Self::VERSION)
+            .map(|ctx| match Self::get_entry(&ctx) {
+                Ok(c) | Err((_, c)) => c,
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Expand a leading `~/` (or a bare `~`) using `$HOME`.
 pub fn expand(path: &str) -> String {
-    match (path.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
-        _ => path.to_string(),
+    expand_with(path, std::env::var("HOME").ok().as_deref())
+}
+
+fn expand_with(path: &str, home: Option<&str>) -> String {
+    match (home, path) {
+        (Some(home), "~") => home.to_string(),
+        (Some(home), p) => p
+            .strip_prefix("~/")
+            .map_or_else(|| p.to_string(), |rest| format!("{home}/{rest}")),
+        (None, p) => p.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_tilde_prefix() {
+        assert_eq!(expand_with("~/Drive", Some("/home/u")), "/home/u/Drive");
+        assert_eq!(expand_with("~", Some("/home/u")), "/home/u");
+    }
+
+    #[test]
+    fn leaves_other_paths_alone() {
+        assert_eq!(expand_with("/mnt/x", Some("/home/u")), "/mnt/x");
+        assert_eq!(expand_with("~other/x", Some("/home/u")), "~other/x");
+        assert_eq!(expand_with("a/~/b", Some("/home/u")), "a/~/b");
+    }
+
+    #[test]
+    fn no_home_means_no_expansion() {
+        assert_eq!(expand_with("~/Drive", None), "~/Drive");
+    }
+
+    #[test]
+    fn defaults_are_stable() {
+        let c = Config::default();
+        assert_eq!(c.rc_addr, "127.0.0.1:5572");
+        assert_eq!(c.service, "rclone-gdrive.service");
     }
 }
