@@ -2,9 +2,12 @@
 
 A [COSMIC](https://github.com/pop-os/cosmic-epoch) panel applet that shows the status of an
 [rclone](https://rclone.org) mount: synced, uploading, downloading, both, error, or mount down.
-Click the panel icon for details, per-file transfer progress, and Open folder / Restart / Stop buttons.
+Click the panel icon for details, per-file transfer progress, the 10 most recently synced files,
+and Open folder / Restart / Stop buttons. "Show all" opens the full history (up to 100 files).
+Clicking a file opens the folder that contains it. Files get the same type icons as COSMIC Files.
 
-Status is read from rclone's remote-control API (`--rc`) plus `systemctl --user` and `/proc/mounts`.
+Status is read from rclone's remote-control API (`--rc`: `core/stats`, `vfs/stats` and
+`core/transferred`) plus `systemctl --user` and `/proc/mounts`.
 
 ## Requirements
 
@@ -39,6 +42,14 @@ Then add "rclone Status" in COSMIC Settings → Desktop → Panel → Configure 
 
 rclone does not report transfer direction, so a transfer counts as a download when there are more
 active transfers than VFS uploads in progress. This is a heuristic.
+
+The recent-files history comes from rclone's in-memory list of completed transfers, so it
+starts empty and resets when rclone restarts. Repeats of the same file are shown as one row
+(`×N`) at its latest time, and new entries appear after a 2 second delay so the list doesn't
+jump on every poll. Newer rclone versions report each transfer's source and destination; when
+they do, rows get an upload or download arrow. Older versions (such as 1.60) show no arrow.
+File icons are chosen from the file name alone (shared-mime-info plus your icon theme); files
+are never read, so nothing is downloaded to draw the list.
 
 ## License
 

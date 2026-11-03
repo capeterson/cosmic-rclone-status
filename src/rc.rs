@@ -5,7 +5,7 @@
 use crate::config::{expand, Config};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Deserializer};
-use std::{process::Command, time::Duration};
+use std::{collections::HashMap, process::Command, time::Duration};
 
 /// Treat JSON `null` like a missing field.
 fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
@@ -29,6 +29,125 @@ pub struct Transfer {
     pub percentage: u64,
     #[serde(default)]
     pub speed: f64,
+}
+
+/// Which way a completed transfer went. Only known when rclone reports `srcFs`/`dstFs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Upload,
+    Download,
+}
+
+/// A finished transfer from `core/transferred`, with repeats of the same file merged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletedTransfer {
+    /// Path relative to the remote root, e.g. `Docs/report.pdf`.
+    pub name: String,
+    /// `-1` when rclone doesn't know the size.
+    pub size: i64,
+    pub bytes: i64,
+    /// When the most recent transfer of this file finished (or started, if it never finished).
+    pub at: Option<jiff::Timestamp>,
+    /// Set when the most recent transfer of this file failed.
+    pub error: Option<String>,
+    pub direction: Option<Direction>,
+    /// How many raw entries were merged into this row (>= 1).
+    pub times: u32,
+}
+
+/// Newest files kept in the history. rclone itself keeps about this many per stats group.
+pub const HISTORY_CAP: usize = 100;
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawTransferred {
+    #[serde(deserialize_with = "null_as_default")]
+    name: String,
+    size: i64,
+    bytes: i64,
+    checked: bool,
+    #[serde(deserialize_with = "null_as_default")]
+    started_at: String,
+    #[serde(deserialize_with = "null_as_default")]
+    completed_at: String,
+    #[serde(deserialize_with = "null_as_default")]
+    error: String,
+    /// Newer rclone only.
+    #[serde(rename = "srcFs")]
+    src_fs: Option<String>,
+    #[serde(rename = "dstFs")]
+    dst_fs: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TransferredResp {
+    #[serde(deserialize_with = "null_as_default")]
+    transferred: Vec<RawTransferred>,
+}
+
+/// Parse rclone's Go timestamps. Go's zero time (`0001-01-01…`) means "not set".
+fn parse_ts(s: &str) -> Option<jiff::Timestamp> {
+    s.parse::<jiff::Timestamp>()
+        .ok()
+        .filter(|t| t.as_second() > 0)
+}
+
+/// A remote looks like `name:path`; local paths start with `/` (or `local:`).
+fn fs_kind(fs: &str) -> Option<bool> {
+    if fs.starts_with('/') || fs.starts_with("local:") || fs.starts_with("Local file system") {
+        return Some(false);
+    }
+    let i = fs.find(':')?;
+    (i > 0 && !fs[..i].contains('/')).then_some(true)
+}
+
+/// Uploads go from a local path to a remote, downloads the other way round.
+fn direction(src: Option<&str>, dst: Option<&str>) -> Option<Direction> {
+    match (fs_kind(src?)?, fs_kind(dst?)?) {
+        (false, true) => Some(Direction::Upload),
+        (true, false) => Some(Direction::Download),
+        _ => None,
+    }
+}
+
+/// Newest first; one row per file name, carrying the newest entry's timestamp and outcome.
+fn history(raw: Vec<RawTransferred>, cap: usize) -> Vec<CompletedTransfer> {
+    let mut entries: Vec<(usize, CompletedTransfer)> = raw
+        .into_iter()
+        .enumerate()
+        .filter(|(_, r)| !r.checked && !r.name.is_empty())
+        .map(|(i, r)| {
+            let at = parse_ts(&r.completed_at).or_else(|| parse_ts(&r.started_at));
+            let error = Some(r.error.trim().to_string()).filter(|e| !e.is_empty());
+            let t = CompletedTransfer {
+                direction: direction(r.src_fs.as_deref(), r.dst_fs.as_deref()),
+                name: r.name,
+                size: r.size,
+                bytes: r.bytes,
+                at,
+                error,
+                times: 1,
+            };
+            (i, t)
+        })
+        .collect();
+    // rclone appends in completion order but sums several groups, so sort by time. Ties (and
+    // entries without any timestamp) fall back to arrival order: later wins.
+    entries.sort_by(|(ia, a), (ib, b)| (b.at, ib).cmp(&(a.at, ia)));
+
+    let mut out: Vec<CompletedTransfer> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (_, t) in entries {
+        if let Some(&i) = seen.get(&t.name) {
+            out[i].times += 1;
+        } else {
+            seen.insert(t.name.clone(), out.len());
+            out.push(t);
+        }
+    }
+    out.truncate(cap);
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +177,8 @@ pub struct Status {
     pub speed: f64,
     pub last_error: Option<String>,
     pub transfers: Vec<Transfer>,
+    /// Recently completed transfers, newest first, at most [`HISTORY_CAP`].
+    pub recent: Vec<CompletedTransfer>,
 }
 
 impl Status {
@@ -221,18 +342,27 @@ fn rc_call<T: for<'de> Deserialize<'de>>(
         .map_err(|e| e.to_string())
 }
 
-/// What the rc API told us: `core/stats` plus `vfs/stats`.
+/// What the rc API told us: `core/stats`, `vfs/stats` and `core/transferred`.
 struct RcStats {
     core: CoreStats,
     vfs: VfsStats,
+    transferred: Vec<RawTransferred>,
 }
 
 fn fetch_rc(addr: &str, auth: Option<&str>, timeout: Duration) -> Result<RcStats, String> {
     let agent = ureq::AgentBuilder::new().timeout(timeout).build();
     let core = rc_call(&agent, addr, auth, "core/stats");
     let vfs = rc_call(&agent, addr, auth, "vfs/stats");
+    // The history is a nicety: if it fails, the rest of the snapshot is still good.
+    let transferred = rc_call::<TransferredResp>(&agent, addr, auth, "core/transferred")
+        .map(|r| r.transferred)
+        .unwrap_or_default();
     match (core, vfs) {
-        (Ok(core), Ok(vfs)) => Ok(RcStats { core, vfs }),
+        (Ok(core), Ok(vfs)) => Ok(RcStats {
+            core,
+            vfs,
+            transferred,
+        }),
         (Err(e), _) | (_, Err(e)) => Err(e),
     }
 }
@@ -252,11 +382,16 @@ fn assemble(service_active: bool, mounted: bool, rc: Option<Result<RcStats, Stri
         speed: 0.0,
         last_error: None,
         transfers: vec![],
+        recent: vec![],
     };
     match rc {
         None => {}
         Some(Err(e)) => st.rc_error = Some(e),
-        Some(Ok(RcStats { core, vfs })) => {
+        Some(Ok(RcStats {
+            core,
+            vfs,
+            transferred,
+        })) => {
             let d = vfs.disk_cache;
             st.uploads_in_progress = d.uploads_in_progress;
             st.uploads_queued = d.uploads_queued;
@@ -267,6 +402,7 @@ fn assemble(service_active: bool, mounted: bool, rc: Option<Result<RcStats, Stri
             st.speed = core.speed;
             st.last_error = core.last_error.filter(|e| !e.is_empty());
             st.transfers = core.transferring;
+            st.recent = history(transferred, HISTORY_CAP);
         }
     }
     st
@@ -293,6 +429,29 @@ pub fn service_action(cfg: &Config, verb: &str) -> bool {
 pub fn open_mount(cfg: &Config) {
     let _ = Command::new("xdg-open")
         .arg(expand(&cfg.mount_path))
+        .spawn();
+}
+
+/// The mount-side folder holding the remote path `name`. Falls back to the mount root for
+/// top-level files and for paths that try to climb out with `..`.
+fn containing_dir(mount_path: &str, name: &str) -> String {
+    let mount = expand(mount_path);
+    let mount = if mount.len() > 1 {
+        mount.trim_end_matches('/').to_string()
+    } else {
+        mount
+    };
+    match name.trim_end_matches('/').rsplit_once('/') {
+        Some((dir, _)) if !dir.split('/').any(|c| c == "..") => format!("{mount}/{dir}"),
+        _ => mount,
+    }
+}
+
+/// Open the folder that contains `name` in the file manager. Opening the folder (not the
+/// file) never triggers a download.
+pub fn open_containing(cfg: &Config, name: &str) {
+    let _ = Command::new("xdg-open")
+        .arg(containing_dir(&cfg.mount_path, name))
         .spawn();
 }
 
@@ -545,6 +704,15 @@ other: /home/u/Other fuse.sshfs rw 0 0
         let (addr, h) = serve(vec![
             ("200 OK", r#"{"speed":12.5,"lastError":"","transferring":[{"name":"f","size":10,"bytes":5,"percentage":50}]}"#.into()),
             ("200 OK", r#"{"diskCache":{"uploadsInProgress":1}}"#.into()),
+            (
+                "200 OK",
+                r#"{"transferred":[
+                    {"name":"old.txt","size":1,"bytes":1,"checked":false,
+                     "completed_at":"2026-11-02T10:00:00Z","error":""},
+                    {"name":"Docs/new.pdf","size":2048,"bytes":2048,"checked":false,
+                     "completed_at":"2026-11-02T11:00:00.5-08:00","error":""}]}"#
+                    .into(),
+            ),
         ]);
         let rc = fetch_rc(&addr, Some("Basic dTpw"), T).unwrap();
         let st = assemble(true, true, Some(Ok(rc)));
@@ -552,16 +720,20 @@ other: /home/u/Other fuse.sshfs rw 0 0
         assert!((st.speed - 12.5).abs() < f64::EPSILON);
         assert_eq!(st.last_error, None, "empty lastError is dropped");
         assert_eq!(st.health(), Health::Uploading);
+        let names: Vec<_> = st.recent.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Docs/new.pdf", "old.txt"], "newest first");
 
         let reqs = h.join().unwrap();
         assert!(reqs[0].starts_with("POST /core/stats "));
         assert!(reqs[1].starts_with("POST /vfs/stats "));
+        assert!(reqs[2].starts_with("POST /core/transferred "));
         assert!(reqs[0].to_lowercase().contains("authorization: basic dtpw"));
     }
 
     #[test]
     fn fetch_rc_reports_http_errors() {
         let (addr, h) = serve(vec![
+            ("401 Unauthorized", "{}".into()),
             ("401 Unauthorized", "{}".into()),
             ("401 Unauthorized", "{}".into()),
         ]);
@@ -576,6 +748,7 @@ other: /home/u/Other fuse.sshfs rw 0 0
         let (addr, h) = serve(vec![
             ("200 OK", r#"{"speed":1.0}"#.into()),
             ("500 Internal Server Error", r#"{"error":"no vfs"}"#.into()),
+            ("200 OK", r#"{"transferred":[]}"#.into()),
         ]);
         let st = assemble(true, true, Some(fetch_rc(&addr, None, T)));
         assert!(st.rc_error.is_some());
@@ -594,9 +767,206 @@ other: /home/u/Other fuse.sshfs rw 0 0
 
     #[test]
     fn malformed_json_is_an_error() {
-        let (addr, h) = serve(vec![("200 OK", "not json".into()), ("200 OK", "{}".into())]);
+        let (addr, h) = serve(vec![
+            ("200 OK", "not json".into()),
+            ("200 OK", "{}".into()),
+            ("200 OK", "{}".into()),
+        ]);
         assert!(fetch_rc(&addr, None, T).is_err());
         h.join().unwrap();
+    }
+
+    #[test]
+    fn history_failure_is_not_fatal() {
+        let (addr, h) = serve(vec![
+            ("200 OK", r#"{"speed":1.0}"#.into()),
+            ("200 OK", "{}".into()),
+            ("500 Internal Server Error", r#"{"error":"nope"}"#.into()),
+        ]);
+        let st = assemble(true, true, Some(fetch_rc(&addr, None, T)));
+        assert!(st.rc_error.is_none());
+        assert_eq!(st.recent.len(), 0);
+        assert_eq!(st.health(), Health::Synced);
+        h.join().unwrap();
+    }
+
+    // ---- completed-transfer history -------------------------------------
+
+    fn raw(json: &str) -> Vec<RawTransferred> {
+        serde_json::from_str::<TransferredResp>(&format!(r#"{{"transferred":{json}}}"#))
+            .unwrap()
+            .transferred
+    }
+
+    fn entry(name: &str, done: &str, error: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","size":10,"bytes":10,"completed_at":"{done}","error":"{error}"}}"#
+        )
+    }
+
+    #[test]
+    fn transferred_parses_a_full_entry() {
+        let r = raw(
+            r#"[{"name":"Docs/a.txt","size":-1,"bytes":7,"checked":false,
+                "started_at":"2026-11-02T10:00:00-08:00","completed_at":"2026-11-02T10:00:01.123456789-08:00",
+                "error":"boom","group":"job/1","srcFs":"/home/u/.cache/rclone/vfs/gd","dstFs":"gd:"}]"#,
+        );
+        let h = history(r, 10);
+        assert_eq!(h.len(), 1);
+        let t = &h[0];
+        assert_eq!((t.name.as_str(), t.size, t.bytes), ("Docs/a.txt", -1, 7));
+        assert_eq!(t.error.as_deref(), Some("boom"));
+        assert_eq!(t.direction, Some(Direction::Upload));
+        assert_eq!(t.times, 1);
+        assert_eq!(
+            t.at,
+            Some("2026-11-02T18:00:01.123456789Z".parse().unwrap()),
+            "offset is normalised, nanoseconds kept"
+        );
+    }
+
+    #[test]
+    fn null_or_missing_fields_do_not_break_parsing() {
+        assert!(raw("null").is_empty());
+        let h = history(
+            raw(
+                r#"[{"name":"a","error":null,"completed_at":null,"started_at":null}, {"name":"b"}]"#,
+            ),
+            10,
+        );
+        assert_eq!(h.len(), 2);
+        assert!(h.iter().all(|t| t.error.is_none() && t.at.is_none()));
+        let none: TransferredResp = serde_json::from_str("{}").unwrap();
+        assert!(none.transferred.is_empty());
+    }
+
+    #[test]
+    fn timestamps_zero_and_garbage_are_unset() {
+        assert!(parse_ts("").is_none());
+        assert!(parse_ts("nope").is_none());
+        assert!(parse_ts("0001-01-01T00:00:00Z").is_none(), "Go zero time");
+        assert_eq!(
+            parse_ts("2026-11-02T10:00:00-08:00"),
+            parse_ts("2026-11-02T18:00:00Z")
+        );
+    }
+
+    #[test]
+    fn history_sorts_newest_first_regardless_of_arrival_order() {
+        let j = format!(
+            "[{},{},{}]",
+            entry("mid", "2026-11-02T10:00:00Z", ""),
+            entry("new", "2026-11-02T12:00:00Z", ""),
+            entry("old", "2026-11-02T08:00:00Z", ""),
+        );
+        let names: Vec<_> = history(raw(&j), 10).into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["new", "mid", "old"]);
+    }
+
+    #[test]
+    fn repeats_merge_into_one_row_at_the_latest_time() {
+        let j = format!(
+            "[{},{},{},{}]",
+            entry("f", "2026-11-02T09:00:00Z", "first try failed"),
+            entry("other", "2026-11-02T10:00:00Z", ""),
+            entry("f", "2026-11-02T11:00:00Z", ""),
+            entry("f", "2026-11-02T08:00:00Z", ""),
+        );
+        let h = history(raw(&j), 10);
+        let names: Vec<_> = h.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["f", "other"], "f sorts by its newest timestamp");
+        assert_eq!(h[0].times, 3);
+        assert_eq!(h[0].at, parse_ts("2026-11-02T11:00:00Z"));
+        assert_eq!(h[0].error, None, "the newest attempt's outcome wins");
+    }
+
+    #[test]
+    fn a_newer_failure_overrides_an_older_success() {
+        let j = format!(
+            "[{},{}]",
+            entry("f", "2026-11-02T09:00:00Z", ""),
+            entry("f", "2026-11-02T10:00:00Z", "later failure"),
+        );
+        let h = history(raw(&j), 10);
+        assert_eq!(h[0].error.as_deref(), Some("later failure"));
+    }
+
+    #[test]
+    fn checks_and_nameless_entries_are_dropped() {
+        let h = history(
+            raw(r#"[{"name":"c","checked":true},{"name":""},{"name":"ok"}]"#),
+            10,
+        );
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].name, "ok");
+    }
+
+    #[test]
+    fn entries_without_timestamps_sort_last_in_arrival_order() {
+        let j = format!(
+            r#"[{{"name":"u1"}},{},{{"name":"u2"}}]"#,
+            entry("dated", "2026-11-02T10:00:00Z", "")
+        );
+        let names: Vec<_> = history(raw(&j), 10).into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["dated", "u2", "u1"]);
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let items: Vec<String> = (0..150)
+            .map(|i| entry(&format!("f{i}"), "2026-11-02T10:00:00Z", ""))
+            .collect();
+        let h = history(raw(&format!("[{}]", items.join(","))), HISTORY_CAP);
+        assert_eq!(h.len(), HISTORY_CAP);
+    }
+
+    #[test]
+    fn blank_error_strings_mean_no_error() {
+        let h = history(raw(r#"[{"name":"a","error":"  "}]"#), 10);
+        assert_eq!(h[0].error, None);
+    }
+
+    #[test]
+    fn direction_needs_one_local_and_one_remote_side() {
+        use Direction::{Download, Upload};
+        assert_eq!(direction(Some("/cache/vfs"), Some("gd:")), Some(Upload));
+        assert_eq!(
+            direction(Some("local:/cache"), Some("gd:dir")),
+            Some(Upload)
+        );
+        assert_eq!(direction(Some("gd:"), Some("/cache/vfs")), Some(Download));
+        assert_eq!(
+            direction(Some("gd:"), Some("other:")),
+            None,
+            "remote to remote"
+        );
+        assert_eq!(direction(Some("/a"), Some("/b")), None, "local to local");
+        assert_eq!(direction(None, None), None, "older rclone sends neither");
+        assert_eq!(direction(Some("/a"), None), None);
+        assert_eq!(
+            direction(Some("/a:b/c"), Some("gd:")),
+            Some(Upload),
+            "colon inside a path"
+        );
+    }
+
+    // ---- containing folder ----------------------------------------------
+
+    #[test]
+    fn containing_dir_is_the_files_parent_in_the_mount() {
+        assert_eq!(
+            containing_dir("/mnt/gd", "Docs/Sub/a.txt"),
+            "/mnt/gd/Docs/Sub"
+        );
+        assert_eq!(containing_dir("/mnt/gd/", "Docs/a.txt"), "/mnt/gd/Docs");
+        assert_eq!(containing_dir("/mnt/gd", "top.txt"), "/mnt/gd");
+        assert_eq!(containing_dir("/", "top.txt"), "/");
+    }
+
+    #[test]
+    fn containing_dir_refuses_to_climb_out() {
+        assert_eq!(containing_dir("/mnt/gd", "../etc/passwd"), "/mnt/gd");
+        assert_eq!(containing_dir("/mnt/gd", "a/../../b/c"), "/mnt/gd");
     }
 
     #[test]

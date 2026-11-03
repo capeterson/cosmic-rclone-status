@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::config::Config;
-use crate::rc::{self, human, Health, Status};
+use crate::mime_icon;
+use crate::rc::{self, human, CompletedTransfer, Direction, Health, Status};
+use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
-use cosmic::iced::{time, window::Id, Length, Limits, Subscription};
+use cosmic::iced::{time, window::Id, Alignment, Length, Limits, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget;
 use std::time::Duration;
 
 const POLL_OPEN: Duration = Duration::from_secs(1);
 const POLL_CLOSED: Duration = Duration::from_secs(5);
+/// How long the file lists wait before showing new history, so rows don't jump every poll.
+const HISTORY_DEBOUNCE: Duration = Duration::from_secs(2);
+/// Rows shown on the main page; the full history lives on its own page.
+const RECENT_IN_POPUP: usize = 10;
+const ICON_SIZE: u16 = 24;
+
+/// Which view the popup is showing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Page {
+    #[default]
+    Main,
+    History,
+}
 
 #[derive(Default)]
 pub struct AppModel {
@@ -19,6 +34,11 @@ pub struct AppModel {
     status: Option<Status>,
     /// Avoid stacking requests when rclone is slow to answer.
     fetching: bool,
+    page: Page,
+    /// The history the lists display. It trails `status.recent` by up to `HISTORY_DEBOUNCE`.
+    shown: Vec<CompletedTransfer>,
+    /// A `HistoryDebounced` message is already scheduled.
+    history_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +53,12 @@ pub enum Message {
     ServiceAction(&'static str),
     ActionDone,
     OpenFolder,
+    /// Open the folder that holds this remote path.
+    OpenContaining(String),
+    ShowHistory,
+    ShowMain,
+    /// The debounce delay elapsed: show the newest history.
+    HistoryDebounced,
 }
 
 impl AppModel {
@@ -49,6 +75,26 @@ impl AppModel {
                 Err(_) => cosmic::Action::App(Message::FetchFailed),
             },
         )
+    }
+
+    /// Decide when the displayed history catches up with the latest status. The first fill is
+    /// immediate; after that changes show up `HISTORY_DEBOUNCE` after the first unseen one.
+    fn sync_history(&mut self) -> Task<cosmic::Action<Message>> {
+        let Some(st) = &self.status else {
+            return Task::none();
+        };
+        if st.recent == self.shown || self.history_pending {
+            return Task::none();
+        }
+        if self.shown.is_empty() {
+            self.shown.clone_from(&st.recent);
+            return Task::none();
+        }
+        self.history_pending = true;
+        // Build the sleep inside the future: `update` runs outside the tokio runtime.
+        Task::perform(async { tokio::time::sleep(HISTORY_DEBOUNCE).await }, |()| {
+            cosmic::Action::App(Message::HistoryDebounced)
+        })
     }
 
     fn icon(&self) -> widget::icon::Handle {
@@ -133,6 +179,215 @@ fn transfer_line(t: &rc::Transfer) -> String {
     )
 }
 
+/// "just now", "5m ago", "3h ago", "2d ago". Empty when the time is unknown.
+fn ago(now: jiff::Timestamp, then: Option<jiff::Timestamp>) -> String {
+    let Some(then) = then else {
+        return String::new();
+    };
+    let secs = now.as_second() - then.as_second();
+    match secs {
+        i64::MIN..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
+}
+
+/// Split a remote path into its folder (possibly empty) and file name.
+fn split_path(name: &str) -> (&str, &str) {
+    let trimmed = name.trim_end_matches('/');
+    trimmed.rsplit_once('/').unwrap_or(("", trimmed))
+}
+
+/// Second line of a history row: `Folder · 1.2 MiB · 5m ago · ×3`.
+fn recent_caption(t: &CompletedTransfer, now: jiff::Timestamp) -> String {
+    let (dir, _) = split_path(&t.name);
+    let mut parts: Vec<String> = vec![];
+    if !dir.is_empty() {
+        parts.push(dir.to_string());
+    }
+    if t.size >= 0 {
+        parts.push(human(t.size as f64));
+    }
+    let when = ago(now, t.at);
+    if !when.is_empty() {
+        parts.push(when);
+    }
+    if t.times > 1 {
+        parts.push(format!("×{}", t.times));
+    }
+    parts.join(" · ")
+}
+
+/// Why the history list is empty, in words.
+fn empty_history_text(st: &Status) -> &'static str {
+    if !st.service_active || st.rc_error.is_some() {
+        "History unavailable"
+    } else {
+        "Nothing synced since rclone started"
+    }
+}
+
+/// A small symbolic emblem from the bundled SVGs.
+fn emblem<'a>(svg: &'static [u8]) -> Element<'a, Message> {
+    let mut handle = widget::icon::from_svg_bytes(svg);
+    handle.symbolic = true;
+    widget::icon(handle).size(16).into()
+}
+
+fn recent_row(t: &CompletedTransfer, now: jiff::Timestamp, detailed: bool) -> Element<'_, Message> {
+    let (_, file) = split_path(&t.name);
+    let mut text = widget::Column::new()
+        .width(Length::Fill)
+        .push(widget::text::body(file).ellipsize(Ellipsize::Middle(EllipsizeHeightLimit::Lines(1))))
+        .push(
+            widget::text::caption(recent_caption(t, now))
+                .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1))),
+        );
+    if let (true, Some(e)) = (detailed, &t.error) {
+        text = text.push(
+            widget::text::caption(format!("Failed: {e}"))
+                .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1))),
+        );
+    }
+    let mut row = widget::Row::new()
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .push(widget::icon(mime_icon::file_icon(&t.name, ICON_SIZE)).size(ICON_SIZE))
+        .push(text);
+    match t.direction {
+        Some(Direction::Upload) => {
+            row = row.push(emblem(include_bytes!("../resources/emblems/uploading.svg")));
+        }
+        Some(Direction::Download) => {
+            row = row.push(emblem(include_bytes!(
+                "../resources/emblems/downloading.svg"
+            )));
+        }
+        None => {}
+    }
+    if t.error.is_some() {
+        row = row.push(emblem(include_bytes!("../resources/emblems/error.svg")));
+    }
+    widget::button::custom(row)
+        .on_press(Message::OpenContaining(t.name.clone()))
+        .class(cosmic::theme::Button::MenuItem)
+        .width(Length::Fill)
+        .padding([4, 8])
+        .into()
+}
+
+impl AppModel {
+    /// The default popup page: status, active transfers, recent files, actions.
+    fn main_page(&self) -> Element<'_, Message> {
+        let mut col = widget::Column::new()
+            .spacing(8)
+            .padding(12)
+            .width(Length::Fill);
+        col = col.push(widget::text::heading(headline(
+            self.status.as_ref().map(Status::health),
+        )));
+
+        if let Some(st) = &self.status {
+            for line in detail_lines(st) {
+                col = col.push(widget::text::body(line));
+            }
+            if let Some(e) = &st.last_error {
+                col = col.push(widget::text::caption(format!("Last error: {e}")));
+            }
+            if !st.transfers.is_empty() {
+                col = col.push(widget::divider::horizontal::default());
+                for t in st.transfers.iter().take(8) {
+                    col = col.push(widget::text::caption(transfer_line(t)));
+                    col = col.push(widget::determinate_linear(t.percentage as f32 / 100.0));
+                }
+                if st.transfers.len() > 8 {
+                    col = col.push(widget::text::caption(format!(
+                        "…and {} more",
+                        st.transfers.len() - 8
+                    )));
+                }
+            }
+            col = col.push(widget::divider::horizontal::default());
+            let mut header = widget::Row::new()
+                .align_y(Alignment::Center)
+                .push(widget::text::heading("Recently synced").width(Length::Fill));
+            if !self.shown.is_empty() {
+                header = header.push(
+                    widget::button::link(format!("Show all ({})", self.shown.len()))
+                        .on_press(Message::ShowHistory),
+                );
+            }
+            col = col.push(header);
+            if self.shown.is_empty() {
+                col = col.push(widget::text::caption(empty_history_text(st)));
+            } else {
+                let now = jiff::Timestamp::now();
+                let rows = self
+                    .shown
+                    .iter()
+                    .take(RECENT_IN_POPUP)
+                    .fold(widget::Column::new().width(Length::Fill), |c, t| {
+                        c.push(recent_row(t, now, false))
+                    });
+                col = col.push(widget::container(widget::scrollable(rows)).max_height(320.0));
+            }
+        }
+
+        let running = self.status.as_ref().is_some_and(|s| s.service_active);
+        let actions = widget::Row::new()
+            .spacing(8)
+            .push(widget::button::standard("Open folder").on_press(Message::OpenFolder))
+            .push(if running {
+                widget::button::standard("Restart").on_press(Message::ServiceAction("restart"))
+            } else {
+                widget::button::suggested("Start").on_press(Message::ServiceAction("start"))
+            })
+            .push(
+                widget::button::destructive("Stop")
+                    .on_press_maybe(running.then_some(Message::ServiceAction("stop"))),
+            );
+        col.push(widget::divider::horizontal::default())
+            .push(actions)
+            .into()
+    }
+
+    /// Every file in the history, newest first.
+    fn history_page(&self) -> Element<'_, Message> {
+        let header = widget::Row::new()
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .push(
+                widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
+                    .on_press(Message::ShowMain),
+            )
+            .push(widget::text::heading("Sync history"));
+        let mut col = widget::Column::new()
+            .spacing(8)
+            .padding(12)
+            .width(Length::Fill)
+            .push(header);
+        if self.shown.is_empty() {
+            let text = self.status.as_ref().map_or("Checking…", empty_history_text);
+            col = col.push(widget::text::body(text));
+        } else {
+            col = col.push(widget::text::caption(format!(
+                "Last {} files since rclone started · newest first",
+                self.shown.len()
+            )));
+            let now = jiff::Timestamp::now();
+            let rows = self
+                .shown
+                .iter()
+                .fold(widget::Column::new().width(Length::Fill), |c, t| {
+                    c.push(recent_row(t, now, true))
+                });
+            col = col.push(widget::container(widget::scrollable(rows)).max_height(520.0));
+        }
+        col.into()
+    }
+}
+
 impl cosmic::Application for AppModel {
     type Executor = cosmic::executor::Default;
     type Flags = ();
@@ -172,57 +427,11 @@ impl cosmic::Application for AppModel {
     }
 
     fn view_window(&self, _id: Id) -> Element<'_, Message> {
-        let mut col = widget::Column::new()
-            .spacing(8)
-            .padding(12)
-            .width(Length::Fill);
-        col = col.push(widget::text::heading(headline(
-            self.status.as_ref().map(Status::health),
-        )));
-
-        match &self.status {
-            None => {}
-            Some(st) => {
-                for line in detail_lines(st) {
-                    col = col.push(widget::text::body(line));
-                }
-                if let Some(e) = &st.last_error {
-                    col = col.push(widget::text::caption(format!("Last error: {e}")));
-                }
-                if !st.transfers.is_empty() {
-                    col = col.push(widget::divider::horizontal::default());
-                    for t in st.transfers.iter().take(8) {
-                        col = col.push(widget::text::caption(transfer_line(t)));
-                        col = col.push(widget::determinate_linear(t.percentage as f32 / 100.0));
-                    }
-                    if st.transfers.len() > 8 {
-                        col = col.push(widget::text::caption(format!(
-                            "…and {} more",
-                            st.transfers.len() - 8
-                        )));
-                    }
-                }
-            }
-        }
-
-        let running = self.status.as_ref().is_some_and(|s| s.service_active);
-        let actions = widget::Row::new()
-            .spacing(8)
-            .push(widget::button::standard("Open folder").on_press(Message::OpenFolder))
-            .push(if running {
-                widget::button::standard("Restart").on_press(Message::ServiceAction("restart"))
-            } else {
-                widget::button::suggested("Start").on_press(Message::ServiceAction("start"))
-            })
-            .push(
-                widget::button::destructive("Stop")
-                    .on_press_maybe(running.then_some(Message::ServiceAction("stop"))),
-            );
-        col = col
-            .push(widget::divider::horizontal::default())
-            .push(actions);
-
-        self.core.applet.popup_container(col).into()
+        let body = match self.page {
+            Page::Main => self.main_page(),
+            Page::History => self.history_page(),
+        };
+        self.core.applet.popup_container(body).into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -245,7 +454,17 @@ impl cosmic::Application for AppModel {
             Message::StatusUpdated(st) => {
                 self.status = Some(st);
                 self.fetching = false;
+                return self.sync_history();
             }
+            Message::HistoryDebounced => {
+                self.history_pending = false;
+                if let Some(st) = &self.status {
+                    self.shown.clone_from(&st.recent);
+                }
+            }
+            Message::ShowHistory => self.page = Page::History,
+            Message::ShowMain => self.page = Page::Main,
+            Message::OpenContaining(name) => rc::open_containing(&self.config, &name),
             Message::FetchFailed => self.fetching = false,
             // Don't clear `fetching`: a poll may still be in flight, and stacking a second
             // request is what the flag prevents. The next tick picks up any change.
@@ -267,6 +486,11 @@ impl cosmic::Application for AppModel {
                 } else {
                     let new_id = Id::unique();
                     self.popup.replace(new_id);
+                    // Open on the main page with the freshest history.
+                    self.page = Page::Main;
+                    if let Some(st) = &self.status {
+                        self.shown.clone_from(&st.recent);
+                    }
                     let mut settings = self.core.applet.get_popup_settings(
                         self.core.main_window_id().unwrap(),
                         new_id,
@@ -285,6 +509,7 @@ impl cosmic::Application for AppModel {
             Message::PopupClosed(id) => {
                 if self.popup == Some(id) {
                     self.popup = None;
+                    self.page = Page::Main;
                 }
             }
         }
@@ -315,6 +540,7 @@ mod tests {
             speed: 0.0,
             last_error: None,
             transfers: vec![],
+            recent: vec![],
         }
     }
 
@@ -414,6 +640,134 @@ mod tests {
         };
         let _ = app.update(Message::UpdateConfig(c.clone()));
         assert_eq!(app.config, c);
+    }
+
+    fn ts(s: &str) -> jiff::Timestamp {
+        s.parse().unwrap()
+    }
+
+    fn done(name: &str, size: i64, at: Option<&str>) -> CompletedTransfer {
+        CompletedTransfer {
+            name: name.into(),
+            size,
+            bytes: size.max(0),
+            at: at.map(ts),
+            error: None,
+            direction: None,
+            times: 1,
+        }
+    }
+
+    #[test]
+    fn ago_covers_every_boundary() {
+        let now = ts("2026-11-02T12:00:00Z");
+        let at = |secs: i64| Some(now - jiff::SignedDuration::from_secs(secs));
+        assert_eq!(ago(now, None), "");
+        assert_eq!(ago(now, at(0)), "just now");
+        assert_eq!(ago(now, at(59)), "just now");
+        assert_eq!(ago(now, at(60)), "1m ago");
+        assert_eq!(ago(now, at(3599)), "59m ago");
+        assert_eq!(ago(now, at(3600)), "1h ago");
+        assert_eq!(ago(now, at(86399)), "23h ago");
+        assert_eq!(ago(now, at(86400)), "1d ago");
+        assert_eq!(ago(now, at(-30)), "just now", "clock skew");
+    }
+
+    #[test]
+    fn split_path_separates_folder_and_file() {
+        assert_eq!(split_path("a/b/c.txt"), ("a/b", "c.txt"));
+        assert_eq!(split_path("c.txt"), ("", "c.txt"));
+        assert_eq!(split_path("a/b/"), ("a", "b"));
+    }
+
+    #[test]
+    fn recent_caption_joins_the_known_parts() {
+        let now = ts("2026-11-02T12:00:00Z");
+        let mut t = done("Docs/a.bin", 2048, Some("2026-11-02T11:55:00Z"));
+        assert_eq!(recent_caption(&t, now), "Docs · 2.0 KiB · 5m ago");
+        t.times = 3;
+        assert_eq!(recent_caption(&t, now), "Docs · 2.0 KiB · 5m ago · ×3");
+        let t = done("top.bin", -1, None);
+        assert_eq!(recent_caption(&t, now), "", "nothing known, nothing shown");
+    }
+
+    #[test]
+    fn empty_history_text_explains_itself() {
+        let mut s = status();
+        assert_eq!(
+            empty_history_text(&s),
+            "Nothing synced since rclone started"
+        );
+        s.rc_error = Some("down".into());
+        assert_eq!(empty_history_text(&s), "History unavailable");
+        s.rc_error = None;
+        s.service_active = false;
+        assert_eq!(empty_history_text(&s), "History unavailable");
+    }
+
+    #[test]
+    fn first_history_is_shown_immediately() {
+        let mut app = AppModel::default();
+        let mut s = status();
+        s.recent = vec![done("a", 1, None)];
+        let _ = app.update(Message::StatusUpdated(s));
+        assert_eq!(app.shown.len(), 1);
+        assert!(!app.history_pending);
+    }
+
+    #[test]
+    fn later_history_changes_wait_for_the_debounce() {
+        let mut app = AppModel {
+            shown: vec![done("a", 1, None)],
+            ..Default::default()
+        };
+        let mut s = status();
+        s.recent = vec![done("b", 1, None), done("a", 1, None)];
+        let _ = app.update(Message::StatusUpdated(s.clone()));
+        assert_eq!(app.shown.len(), 1, "not yet");
+        assert!(app.history_pending);
+
+        // Further updates while waiting neither show anything nor schedule a second timer.
+        s.recent.insert(0, done("c", 1, None));
+        let _ = app.update(Message::StatusUpdated(s));
+        assert_eq!(app.shown.len(), 1);
+        assert!(app.history_pending);
+
+        let _ = app.update(Message::HistoryDebounced);
+        assert!(!app.history_pending);
+        assert_eq!(app.shown.len(), 3, "catches up to the newest status");
+    }
+
+    #[test]
+    fn unchanged_history_schedules_nothing() {
+        let mut app = AppModel {
+            shown: vec![done("a", 1, None)],
+            ..Default::default()
+        };
+        let mut s = status();
+        s.recent = vec![done("a", 1, None)];
+        let _ = app.update(Message::StatusUpdated(s));
+        assert!(!app.history_pending);
+    }
+
+    #[test]
+    fn history_page_navigation_round_trips() {
+        let mut app = AppModel::default();
+        assert_eq!(app.page, Page::Main);
+        let _ = app.update(Message::ShowHistory);
+        assert_eq!(app.page, Page::History);
+        let _ = app.update(Message::ShowMain);
+        assert_eq!(app.page, Page::Main);
+    }
+
+    #[test]
+    fn closing_the_popup_returns_to_the_main_page() {
+        let mut app = AppModel::default();
+        let id = Id::unique();
+        app.popup = Some(id);
+        app.page = Page::History;
+        let _ = app.update(Message::PopupClosed(id));
+        assert_eq!(app.page, Page::Main);
     }
 
     #[test]
