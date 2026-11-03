@@ -2,9 +2,15 @@
 
 mod app;
 mod config;
+mod mime_icon;
 mod rc;
 
-pub const APP_ID: &str = "com.ca-peterson.CosmicRcloneStatus";
+/// Build with `APP_ID_OVERRIDE=...` to get a side-by-side dev copy with its own panel
+/// identity and config (see `just install-dev`).
+pub const APP_ID: &str = match option_env!("APP_ID_OVERRIDE") {
+    Some(id) => id,
+    None => "com.ca-peterson.CosmicRcloneStatus",
+};
 
 fn main() -> cosmic::iced::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -19,8 +25,13 @@ fn main() -> cosmic::iced::Result {
         {
             cfg.rc_addr.clone_from(addr);
         }
-        let st = rc::fetch(&cfg);
+        let mut st = rc::fetch(&cfg);
+        let recent = std::mem::take(&mut st.recent);
         println!("{st:#?}\nhealth: {:?}", st.health());
+        println!("recent: {} entries", recent.len());
+        for t in recent.iter().take(10) {
+            println!("  {t:?}");
+        }
         return Ok(());
     }
     cosmic::applet::run::<app::AppModel>(())
