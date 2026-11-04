@@ -65,8 +65,13 @@ How it works:
 - Unpinning uploads the last changes first (it waits if you're offline), then unmounts and deletes
   the local copy.
 
-Setup runs as soon as the switch is turned on (if it can't finish, for example the password
-prompt is dismissed, it is undone and the switch goes back off): mounting inside the Drive mount needs the Drive mount to use
+Turning the switch on first shows a dialog listing every change setup will make (only the ones
+not already done); **Continue** goes on to the password prompt, **Cancel** changes nothing and
+leaves the switch off. If setup can't finish (for example the password prompt is dismissed), it
+is undone and the switch goes back off. Before `/etc/fuse.conf` is edited it is copied to
+`/etc/fuse.conf.cosmic-rclone-status-<date-time>.bak`; if that copy fails the file is left alone.
+
+What setup does: mounting inside the Drive mount needs the Drive mount to use
 `--allow-other`, which ordinary users can only request once `user_allow_other` is set in
 `/etc/fuse.conf` (one line, added through the system password prompt). The app then adds a
 drop-in for the mount's service (`<service>.d/50-cosmic-rclone-status.conf`) that sets

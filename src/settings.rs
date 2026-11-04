@@ -68,6 +68,68 @@ pub fn setup_steps(c: Checks) -> [(&'static str, &'static str, bool); 3] {
     ]
 }
 
+/// What setup is about to change, for the consent dialog: one (title, detail) per change still
+/// to be made, plus what stays true afterwards. Built from `c` so already-done steps aren't
+/// listed.
+pub fn consent_items(c: Checks, cfg: &Config) -> Vec<(String, String)> {
+    let mut items = vec![];
+    if !c.fuse_conf {
+        items.push((
+            format!("Change a system setting: {}", fuse_conf::PATH),
+            format!(
+                "Adds the line “user_allow_other”, which lets your own programs mount with \
+                 --allow-other. This needs an administrator password, which you'll be asked for \
+                 next. The current file is first copied to {p}{infix}<date-time>.bak (if that \
+                 copy fails, the file isn't touched). The line stays in place if you turn \
+                 offline folders off later.",
+                p = fuse_conf::PATH,
+                infix = fuse_conf::BACKUP_INFIX,
+            ),
+        ));
+    }
+    if !c.units || !c.keeper_running {
+        items.push((
+            "Install background services".to_string(),
+            format!(
+                "Adds {keeper} and {pin} to {dir}, enables the first, and ties both to {svc} \
+                 so they start and stop with the Drive mount.",
+                keeper = units::keeper_unit_name(),
+                pin = units::pin_unit_name("<folder>"),
+                dir = units::unit_dir().display(),
+                svc = cfg.service,
+            ),
+        ));
+        items.push((
+            "Change the Drive mount's settings".to_string(),
+            format!(
+                "Adds {} so the mount runs with --allow-other, --default-permissions and umask 077. \
+                 Files in the Drive folder then show as owner-only (0600 / 0700), which keeps \
+                 other users on this computer out.",
+                units::dropin_path(&cfg.service).display()
+            ),
+        ));
+    }
+    if !c.mount_allows_other {
+        items.push((
+            format!("Restart {}", cfg.service),
+            format!(
+                "Happens once, now. Anything open in {} is interrupted; changes waiting to upload \
+                 are kept and resume after the restart.",
+                cfg.mount_path
+            ),
+        ));
+    }
+    items.push((
+        "Afterwards".to_string(),
+        format!(
+            "Folders you choose to keep offline are downloaded to {} and use disk space there. \
+             Turning offline folders off removes the services and mount settings again.",
+            pin::data_dir().join("offline").display()
+        ),
+    ));
+    items
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     Refresh,
@@ -75,7 +137,10 @@ enum Message {
     Config(Config),
     ToggleOffline(bool),
     SetUp,
-    Done(Result<(), String>),
+    /// The consent dialog's answer.
+    Consent(bool),
+    /// A setup or teardown finished, with a note to show on success.
+    Done(Result<Option<String>, String>),
     Unpin(String),
     Repair(String),
     Open(String),
@@ -90,6 +155,10 @@ struct App {
     /// A setup or teardown is running; buttons are disabled.
     busy: bool,
     error: Option<String>,
+    /// Something worth telling after a successful setup (where the backup went).
+    note: Option<String>,
+    /// The consent dialog is showing; nothing has been changed yet.
+    consent: bool,
 }
 
 type Task = cosmic::app::Task<Message>;
@@ -107,11 +176,14 @@ fn blocking<T: Send + 'static>(
     )
 }
 
-/// Run the setup steps that aren't done yet, in order.
-fn set_up(cfg: &Config) -> Result<(), String> {
+/// Run the setup steps that aren't done yet, in order. Returns a note for the user (where the
+/// `/etc/fuse.conf` backup went), if there is one.
+fn set_up(cfg: &Config) -> Result<Option<String>, String> {
     let c = Checks::probe(cfg);
+    let mut note = None;
     if !c.fuse_conf {
-        fuse_conf::enable()?;
+        note = fuse_conf::enable()?
+            .map(|b| format!("The previous {} was saved as {b}", fuse_conf::PATH));
     }
     if !c.units || !c.keeper_running {
         units::install(cfg)?;
@@ -119,12 +191,12 @@ fn set_up(cfg: &Config) -> Result<(), String> {
     if !c.mount_allows_other {
         units::systemctl(&["restart", &cfg.service])?;
     }
-    Ok(())
+    Ok(note)
 }
 
-/// Switch offline folders on and run the setup straight away. If it can't finish (say the
-/// password prompt was dismissed), undo it so the switch goes back off with the reason shown.
-fn turn_on(cfg: &Config) -> Result<(), String> {
+/// Switch offline folders on and run the setup. If it can't finish (say the password prompt was
+/// dismissed), undo it so the switch goes back off with the reason shown.
+fn turn_on(cfg: &Config) -> Result<Option<String>, String> {
     Config::save(crate::APP_ID, |c| c.offline_enabled = true)?;
     set_up(cfg).map_err(|e| {
         let _ = tear_down(cfg);
@@ -133,9 +205,9 @@ fn turn_on(cfg: &Config) -> Result<(), String> {
 }
 
 /// Turn offline folders off: everything the setup added except the `/etc/fuse.conf` line.
-fn tear_down(cfg: &Config) -> Result<(), String> {
+fn tear_down(cfg: &Config) -> Result<Option<String>, String> {
     units::remove(cfg)?;
-    Config::save(crate::APP_ID, |c| c.offline_enabled = false).map(|_| ())
+    Config::save(crate::APP_ID, |c| c.offline_enabled = false).map(|_| None)
 }
 
 impl cosmic::Application for App {
@@ -162,6 +234,8 @@ impl cosmic::Application for App {
             state: OfflineState::default(),
             busy: false,
             error: None,
+            note: None,
+            consent: false,
         };
         (app, Task::done(cosmic::Action::App(Message::Refresh)))
     }
@@ -191,24 +265,41 @@ impl cosmic::Application for App {
             Message::Config(c) => self.cfg = c,
             Message::ToggleOffline(on) => {
                 self.error = None;
-                self.busy = true;
-                self.cfg.offline_enabled = on;
-                let cfg = self.cfg.clone();
-                return if on {
-                    blocking(move || turn_on(&cfg), Message::Done)
+                if on {
+                    // Explain first; nothing is changed until the user continues.
+                    self.consent = true;
                 } else {
-                    blocking(move || tear_down(&cfg), Message::Done)
-                };
+                    self.busy = true;
+                    self.cfg.offline_enabled = false;
+                    let cfg = self.cfg.clone();
+                    return blocking(move || tear_down(&cfg), Message::Done);
+                }
             }
             Message::SetUp => {
-                self.busy = true;
                 self.error = None;
+                self.consent = true;
+            }
+            Message::Consent(go) => {
+                self.consent = false;
+                if !go {
+                    // Nothing was saved or changed, so the switch simply stays off.
+                    return Task::none();
+                }
+                self.busy = true;
                 let cfg = self.cfg.clone();
-                return blocking(move || set_up(&cfg), Message::Done);
+                return if cfg.offline_enabled {
+                    blocking(move || set_up(&cfg), Message::Done)
+                } else {
+                    self.cfg.offline_enabled = true;
+                    blocking(move || turn_on(&cfg), Message::Done)
+                };
             }
             Message::Done(r) => {
                 self.busy = false;
-                self.error = r.err();
+                (self.note, self.error) = match r {
+                    Ok(note) => (note, None),
+                    Err(e) => (None, Some(e)),
+                };
                 // A failed turn-on switches itself back off; show that now, not on the next
                 // config notification.
                 self.cfg = Config::load(crate::APP_ID);
@@ -238,6 +329,44 @@ impl cosmic::Application for App {
         Task::none()
     }
 
+    /// Informed consent before setup changes anything: what will change, then Continue (on to
+    /// the password prompt) or Cancel (nothing is changed and the switch stays off).
+    fn dialog(&self) -> Option<Element<'_, Message>> {
+        if !self.consent {
+            return None;
+        }
+        let items = consent_items(self.checks, &self.cfg);
+        let list = items.into_iter().fold(
+            widget::column::with_capacity(8).spacing(cosmic::theme::spacing().space_s),
+            |col, (title, detail)| {
+                col.push(
+                    widget::column::with_capacity(2)
+                        .spacing(2)
+                        .push(widget::text::heading(title))
+                        .push(widget::text::body(detail)),
+                )
+            },
+        );
+        let needs_password = !self.checks.fuse_conf;
+        let go = if needs_password {
+            "Continue to password prompt"
+        } else {
+            "Continue"
+        };
+        Some(
+            widget::dialog()
+                .title("Turn on offline folders?")
+                .icon(widget::icon::from_name("folder-download-symbolic").size(64))
+                .body("Keeping folders offline needs these changes. Nothing has been changed yet.")
+                .control(widget::container(widget::scrollable(list)).max_height(360.0))
+                .primary_action(widget::button::suggested(go).on_press(Message::Consent(true)))
+                .secondary_action(
+                    widget::button::standard("Cancel").on_press(Message::Consent(false)),
+                )
+                .into(),
+        )
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let mut sections: Vec<Element<'_, Message>> = vec![self.offline_section()];
         if self.cfg.offline_enabled && !self.state.notices.is_empty() {
@@ -252,15 +381,20 @@ impl cosmic::Application for App {
                 )
                 .into(),
         );
-        if let Some(e) = &self.error {
-            sections.push(
-                widget::row::with_capacity(2)
-                    .spacing(8)
-                    .align_y(Alignment::Center)
-                    .push(widget::icon::from_name("dialog-error-symbolic").size(16))
-                    .push(widget::text::body(e.as_str()))
-                    .into(),
-            );
+        for (icon, text) in [
+            ("dialog-information-symbolic", &self.note),
+            ("dialog-error-symbolic", &self.error),
+        ] {
+            if let Some(t) = text {
+                sections.push(
+                    widget::row::with_capacity(2)
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .push(widget::icon::from_name(icon).size(16))
+                        .push(widget::text::body(t.as_str()))
+                        .into(),
+                );
+            }
         }
         let sp = cosmic::theme::spacing();
         widget::scrollable(
@@ -273,6 +407,41 @@ impl cosmic::Application for App {
 }
 
 impl App {
+    /// The setup checklist, shown while setup is running or incomplete.
+    fn setup_rows<'a>(
+        &self,
+        mut sec: settings::Section<'a, Message>,
+    ) -> settings::Section<'a, Message> {
+        for (title, desc, done) in setup_steps(self.checks) {
+            let icon = if done {
+                "emblem-ok-symbolic"
+            } else {
+                "dialog-information-symbolic"
+            };
+            sec = sec.add(
+                settings::item::builder(title)
+                    .description(desc)
+                    .icon(widget::icon::from_name(icon).size(16))
+                    .control(widget::text::caption(if done { "Done" } else { "To do" })),
+            );
+        }
+        // Setup starts from the switch; this button only picks up after something undid part
+        // of it (say the drop-in was deleted). Both go through the consent dialog.
+        sec.add(if self.busy {
+            settings::item::builder("Setting up…")
+                .description("Enter your password if asked. The Drive mount restarts once.")
+                .control(widget::Space::new())
+        } else {
+            settings::item::builder("Setup isn't complete")
+                .description(if self.checks.mounted {
+                    "Runs the remaining steps above."
+                } else {
+                    "The Drive mount isn't running; setup will start it."
+                })
+                .control(widget::button::suggested("Set up").on_press(Message::SetUp))
+        })
+    }
+
     fn offline_section(&self) -> Element<'_, Message> {
         let can_turn_off = self.cfg.pins.is_empty() && !self.busy;
         let description = if self.cfg.offline_enabled && !self.cfg.pins.is_empty() {
@@ -281,12 +450,13 @@ impl App {
             "Folders you choose are fully downloaded, kept in sync both ways, and work without a \
              connection, right where they are in the Drive folder."
         };
-        let toggle_allowed = !self.busy && (!self.cfg.offline_enabled || can_turn_off);
+        let toggle_allowed =
+            !self.busy && !self.consent && (!self.cfg.offline_enabled || can_turn_off);
         let mut sec = settings::section().title("Offline folders").add(
             settings::item::builder("Keep folders available offline")
                 .description(description)
                 .toggler_maybe(
-                    self.cfg.offline_enabled,
+                    self.cfg.offline_enabled || self.consent,
                     toggle_allowed.then_some(Message::ToggleOffline),
                 ),
         );
@@ -294,35 +464,7 @@ impl App {
             return sec.into();
         }
         if !self.checks.complete() {
-            for (title, desc, done) in setup_steps(self.checks) {
-                let icon = if done {
-                    "emblem-ok-symbolic"
-                } else {
-                    "dialog-information-symbolic"
-                };
-                sec = sec.add(
-                    settings::item::builder(title)
-                        .description(desc)
-                        .icon(widget::icon::from_name(icon).size(16))
-                        .control(widget::text::caption(if done { "Done" } else { "To do" })),
-                );
-            }
-            // Setup runs by itself when the switch is turned on; the button is only for picking
-            // up after something undid part of it (say the drop-in was deleted).
-            sec = sec.add(if self.busy {
-                settings::item::builder("Setting up…")
-                    .description("Enter your password if asked. The Drive mount restarts once.")
-                    .control(widget::Space::new())
-            } else {
-                settings::item::builder("Setup isn't complete")
-                    .description(if self.checks.mounted {
-                        "Runs the remaining steps above."
-                    } else {
-                        "The Drive mount isn't running; setup will start it."
-                    })
-                    .control(widget::button::suggested("Set up").on_press(Message::SetUp))
-            });
-            return sec.into();
+            return self.setup_rows(sec).into();
         }
         if self.cfg.pins.is_empty() {
             sec = sec.add(settings::item::builder("No folders are kept offline yet").description(
@@ -448,5 +590,46 @@ mod tests {
         assert_eq!(steps.map(|s| s.2), [true, false, false]);
         assert!(steps[0].1.contains("/etc/fuse.conf"));
         assert!(steps[2].1.contains("Only you can open"));
+    }
+
+    #[test]
+    fn consent_lists_every_change_on_a_fresh_system() {
+        let cfg = Config::default();
+        let items = consent_items(Checks::default(), &cfg);
+        let titles: Vec<&str> = items.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Change a system setting: /etc/fuse.conf",
+                "Install background services",
+                "Change the Drive mount's settings",
+                "Restart rclone-gdrive.service",
+                "Afterwards",
+            ]
+        );
+        let fuse = &items[0].1;
+        assert!(fuse.contains("administrator password"), "{fuse}");
+        assert!(
+            fuse.contains("/etc/fuse.conf.cosmic-rclone-status-<date-time>.bak"),
+            "{fuse}"
+        );
+        assert!(items[2]
+            .1
+            .contains("--allow-other, --default-permissions and umask 077"));
+        assert!(items[3].1.contains("~/GoogleDrive"));
+    }
+
+    #[test]
+    fn consent_leaves_out_steps_already_done() {
+        let c = Checks {
+            fuse_conf: true,
+            units: true,
+            keeper_running: true,
+            mounted: true,
+            mount_allows_other: false,
+        };
+        let items = consent_items(c, &Config::default());
+        let titles: Vec<&str> = items.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(titles, ["Restart rclone-gdrive.service", "Afterwards"]);
     }
 }
