@@ -122,6 +122,16 @@ fn set_up(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Switch offline folders on and run the setup straight away. If it can't finish (say the
+/// password prompt was dismissed), undo it so the switch goes back off with the reason shown.
+fn turn_on(cfg: &Config) -> Result<(), String> {
+    Config::save(crate::APP_ID, |c| c.offline_enabled = true)?;
+    set_up(cfg).map_err(|e| {
+        let _ = tear_down(cfg);
+        format!("Offline folders weren't turned on: {e}")
+    })
+}
+
 /// Turn offline folders off: everything the setup added except the `/etc/fuse.conf` line.
 fn tear_down(cfg: &Config) -> Result<(), String> {
     units::remove(cfg)?;
@@ -181,16 +191,14 @@ impl cosmic::Application for App {
             Message::Config(c) => self.cfg = c,
             Message::ToggleOffline(on) => {
                 self.error = None;
-                if on {
-                    if let Err(e) = Config::save(crate::APP_ID, |c| c.offline_enabled = true) {
-                        self.error = Some(e);
-                    }
-                    self.cfg.offline_enabled = true;
+                self.busy = true;
+                self.cfg.offline_enabled = on;
+                let cfg = self.cfg.clone();
+                return if on {
+                    blocking(move || turn_on(&cfg), Message::Done)
                 } else {
-                    self.busy = true;
-                    let cfg = self.cfg.clone();
-                    return blocking(move || tear_down(&cfg), Message::Done);
-                }
+                    blocking(move || tear_down(&cfg), Message::Done)
+                };
             }
             Message::SetUp => {
                 self.busy = true;
@@ -201,6 +209,9 @@ impl cosmic::Application for App {
             Message::Done(r) => {
                 self.busy = false;
                 self.error = r.err();
+                // A failed turn-on switches itself back off; show that now, not on the next
+                // config notification.
+                self.cfg = Config::load(crate::APP_ID);
                 return self.update(Message::Refresh);
             }
             Message::Unpin(rel) => {
@@ -270,7 +281,7 @@ impl App {
             "Folders you choose are fully downloaded, kept in sync both ways, and work without a \
              connection, right where they are in the Drive folder."
         };
-        let toggle_allowed = !self.cfg.offline_enabled || can_turn_off;
+        let toggle_allowed = !self.busy && (!self.cfg.offline_enabled || can_turn_off);
         let mut sec = settings::section().title("Offline folders").add(
             settings::item::builder("Keep folders available offline")
                 .description(description)
@@ -296,19 +307,21 @@ impl App {
                         .control(widget::text::caption(if done { "Done" } else { "To do" })),
                 );
             }
-            let label = if self.busy { "Setting up…" } else { "Set up" };
-            sec = sec.add(
-                settings::item::builder("Finish setup")
+            // Setup runs by itself when the switch is turned on; the button is only for picking
+            // up after something undid part of it (say the drop-in was deleted).
+            sec = sec.add(if self.busy {
+                settings::item::builder("Setting up…")
+                    .description("Enter your password if asked. The Drive mount restarts once.")
+                    .control(widget::Space::new())
+            } else {
+                settings::item::builder("Setup isn't complete")
                     .description(if self.checks.mounted {
                         "Runs the remaining steps above."
                     } else {
                         "The Drive mount isn't running; setup will start it."
                     })
-                    .control(
-                        widget::button::suggested(label)
-                            .on_press_maybe((!self.busy).then_some(Message::SetUp)),
-                    ),
-            );
+                    .control(widget::button::suggested("Set up").on_press(Message::SetUp))
+            });
             return sec.into();
         }
         if self.cfg.pins.is_empty() {
