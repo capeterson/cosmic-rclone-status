@@ -12,6 +12,7 @@
 //! local side is kept short.
 
 use crate::config::{expand, Config};
+use crate::rc::{ChangeKind, Direction};
 use crate::share;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -266,44 +267,33 @@ pub struct OfflineState {
     pub pins: Vec<PinState>,
     /// Newest last; trimmed to [`NOTICES_KEPT`].
     pub notices: Vec<Notice>,
-    /// Deletions synced in offline folders, newest last; trimmed to [`ACTIVITY_KEPT`]. rclone
-    /// keeps no record of deletions itself, so this is the only place they show up.
-    pub deletions: Vec<Deletion>,
+    /// What offline-folder syncs did, newest last; trimmed to [`ACTIVITY_KEPT`]. rclone's own
+    /// history can't say whether a file was new, changed or deleted, or which way it went.
+    pub changes: Vec<Change>,
 }
 
 pub const NOTICES_KEPT: usize = 20;
 pub const ACTIVITY_KEPT: usize = 100;
 
-/// Where a deleted file was deleted. The sync then removed it from the other side.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DeletedIn {
-    /// Deleted on this computer; the sync removed it from the cloud.
-    #[default]
-    Here,
-    /// Deleted in the cloud (another device, the web); the sync removed it here.
-    Cloud,
-}
-
-/// A file deleted in an offline folder and synced.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Deletion {
+/// One file a sync of an offline folder created, updated or deleted on the other side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Change {
     /// Unix seconds when the sync applied it.
     pub at: i64,
     /// Path relative to the mount root, e.g. `Work/Taxes/2024.pdf`.
     pub path: String,
-    pub deleted_in: DeletedIn,
+    /// Bytes, or `-1` for a deletion.
+    pub size: i64,
+    pub kind: ChangeKind,
+    /// `Upload`: changed on this computer and sent to the cloud; `Download`: the reverse.
+    pub direction: Direction,
 }
 
 impl OfflineState {
-    pub fn record_deletion(&mut self, at: i64, path: String, deleted_in: DeletedIn) {
-        self.deletions.push(Deletion {
-            at,
-            path,
-            deleted_in,
-        });
-        let extra = self.deletions.len().saturating_sub(ACTIVITY_KEPT);
-        self.deletions.drain(..extra);
+    pub fn record_change(&mut self, change: Change) {
+        self.changes.push(change);
+        let extra = self.changes.len().saturating_sub(ACTIVITY_KEPT);
+        self.changes.drain(..extra);
     }
 
     pub fn pin(&self, rel: &str) -> Option<&PinState> {

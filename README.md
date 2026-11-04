@@ -79,9 +79,11 @@ drop-in for the mount's service (`<service>.d/50-cosmic-rclone-status.conf`) tha
 can't open your files, and restarts the mount once. Turning offline folders off removes the
 services and the drop-in; the `/etc/fuse.conf` line is left in place.
 
-Deletions bisync applies are shown in the popup's recent activity, marked *Deleted here* (removed
-from the cloud) or *Deleted in the cloud* (removed here). A sync that would delete more than half
-of a folder's files (and more than 3) stops with **Needs attention** instead.
+Each file a sync changes shows in the popup's recent activity with two small icons (hover for a
+tooltip): what happened (new, changed or deleted) and which way (an up arrow for this computer
+→ cloud, a down arrow for cloud → here). The keeper works this out by comparing the local copy
+with bisync's listings before and after each sync. A sync that would delete more than half of a
+folder's files (and more than 3) stops with **Needs attention** instead.
 
 See [Known limits](#known-limits) for what offline folders can't do.
 
@@ -137,10 +139,12 @@ are never read, so nothing is downloaded to draw the list.
 
 ## Known limits
 
-- **Deletions only show for offline folders.** rclone keeps no record of deleted files: they are
-  not in its transfer history and are only logged at debug level. So the recent-activity list
-  shows deletions only when an offline folder's sync applies them. Files deleted elsewhere in the
-  Drive folder (or on another device) don't appear.
+- **New / changed / deleted icons only show for offline folders.** rclone's transfer history
+  doesn't say whether a file was new or changed, and keeps no record of deletions at all (they are
+  only logged at debug level). So for the rest of the Drive folder, rows have no kind icon, and
+  files deleted there (or on another device) don't appear.
+- **Direction arrows need a newer rclone outside offline folders.** rclone 1.60 doesn't report
+  where a transfer went; newer versions add `srcFs`/`dstFs`, and rows then get an arrow.
 - **Offline folders are folders only**, can't be nested inside each other, and very long folder
   paths are refused (rclone 1.60's bisync names its working files after both full paths).
 - **Moving a file into or out of an offline folder** is a copy plus a delete, because it crosses

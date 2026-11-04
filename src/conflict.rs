@@ -13,8 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
-const P1: &str = "..path1";
-const P2: &str = "..path2";
+pub const P1: &str = "..path1";
+pub const P2: &str = "..path2";
 
 /// The remote operations conflict resolution needs, so tests can run without rclone.
 pub trait Remote {

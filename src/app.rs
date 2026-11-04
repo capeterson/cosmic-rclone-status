@@ -2,8 +2,8 @@
 
 use crate::config::Config;
 use crate::mime_icon;
-use crate::pin::{self, DeletedIn, Deletion, OfflineState};
-use crate::rc::{self, human, CompletedTransfer, Direction, Health, Status};
+use crate::pin::{self, Change, OfflineState};
+use crate::rc::{self, human, ChangeKind, CompletedTransfer, Direction, Health, Status};
 use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
 use cosmic::iced::{time, window::Id, Alignment, Length, Limits, Subscription};
@@ -259,11 +259,6 @@ fn recent_caption(t: &CompletedTransfer, now: jiff::Timestamp) -> String {
     if !dir.is_empty() {
         parts.push(dir.to_string());
     }
-    match t.deleted {
-        Some(DeletedIn::Here) => parts.push("Deleted here".into()),
-        Some(DeletedIn::Cloud) => parts.push("Deleted in the cloud".into()),
-        None => {}
-    }
     if t.size >= 0 {
         parts.push(human(t.size as f64));
     }
@@ -277,27 +272,55 @@ fn recent_caption(t: &CompletedTransfer, now: jiff::Timestamp) -> String {
     parts.join(" · ")
 }
 
-/// rclone's transfer history with offline-folder deletions mixed in, newest first. rclone
-/// records no deletions, so these come from the keeper (`offline.json`).
-fn with_deletions(recent: Vec<CompletedTransfer>, dels: &[Deletion]) -> Vec<CompletedTransfer> {
-    if dels.is_empty() {
+/// rclone's transfer history with offline-folder changes mixed in, newest first. rclone can't
+/// say what kind of change a transfer was, so offline folders' come from the keeper.
+fn with_changes(recent: Vec<CompletedTransfer>, changes: &[Change]) -> Vec<CompletedTransfer> {
+    if changes.is_empty() {
         return recent;
     }
     let mut all = recent;
-    all.extend(dels.iter().map(|d| CompletedTransfer {
-        name: d.path.clone(),
-        size: -1,
-        bytes: 0,
-        at: jiff::Timestamp::from_second(d.at).ok(),
+    all.extend(changes.iter().map(|c| CompletedTransfer {
+        name: c.path.clone(),
+        size: c.size,
+        bytes: c.size.max(0),
+        at: jiff::Timestamp::from_second(c.at).ok(),
         error: None,
-        direction: None,
+        direction: Some(c.direction),
         times: 1,
-        deleted: Some(d.deleted_in),
+        kind: Some(c.kind),
     }));
     // Stable, so rclone's own order holds among equal times; unknown times go last.
     all.sort_by_key(|t| std::cmp::Reverse(t.at));
     all.truncate(rc::HISTORY_CAP);
     all
+}
+
+/// The kind icon and its tooltip: new, changed or deleted.
+fn kind_icon(kind: ChangeKind) -> (&'static str, &'static str) {
+    match kind {
+        ChangeKind::Created => ("document-new-symbolic", "New file"),
+        ChangeKind::Updated => ("document-edit-symbolic", "Changed"),
+        ChangeKind::Deleted => ("user-trash-symbolic", "Deleted"),
+    }
+}
+
+/// The direction arrow's tooltip, worded for what happened to the file.
+fn direction_tip(direction: Direction, kind: Option<ChangeKind>) -> &'static str {
+    match (direction, kind) {
+        (Direction::Upload, Some(ChangeKind::Deleted)) => "Deleted here, so removed from the cloud",
+        (Direction::Download, Some(ChangeKind::Deleted)) => "Deleted in the cloud, so removed here",
+        (Direction::Upload, _) => "Uploaded to the cloud",
+        (Direction::Download, _) => "Downloaded from the cloud",
+    }
+}
+
+fn with_tip<'a>(icon: Element<'a, Message>, tip: &'static str) -> Element<'a, Message> {
+    widget::tooltip(
+        icon,
+        widget::text::body(tip),
+        widget::tooltip::Position::Top,
+    )
+    .into()
 }
 
 /// Why the history list is empty, in words.
@@ -336,29 +359,24 @@ fn recent_row(t: &CompletedTransfer, now: jiff::Timestamp, detailed: bool) -> El
         .align_y(Alignment::Center)
         .push(widget::icon(mime_icon::file_icon(&t.name, ICON_SIZE)).size(ICON_SIZE))
         .push(text);
-    match t.direction {
-        Some(Direction::Upload) => {
-            row = row.push(emblem(include_bytes!("../resources/emblems/uploading.svg")));
-        }
-        Some(Direction::Download) => {
-            row = row.push(emblem(include_bytes!(
-                "../resources/emblems/downloading.svg"
-            )));
-        }
-        None => {}
+    if let Some(kind) = t.kind {
+        let (icon, tip) = kind_icon(kind);
+        row = row.push(with_tip(widget::icon::from_name(icon).size(16).into(), tip));
+    }
+    if let Some(dir) = t.direction {
+        let svg: &'static [u8] = match dir {
+            Direction::Upload => include_bytes!("../resources/emblems/uploading.svg"),
+            Direction::Download => include_bytes!("../resources/emblems/downloading.svg"),
+        };
+        row = row.push(with_tip(emblem(svg), direction_tip(dir, t.kind)));
     }
     if t.error.is_some() {
         row = row.push(emblem(include_bytes!("../resources/emblems/error.svg")));
     }
-    if t.deleted.is_some() {
-        row = row.push(widget::icon::from_name("user-trash-symbolic").size(16));
-    }
     widget::button::custom(row)
         // A deleted file has no details to show.
         .on_press_maybe(
-            t.deleted
-                .is_none()
-                .then(|| Message::OpenDetails(t.name.clone())),
+            (t.kind != Some(ChangeKind::Deleted)).then(|| Message::OpenDetails(t.name.clone())),
         )
         .class(cosmic::theme::Button::MenuItem)
         .width(Length::Fill)
@@ -587,7 +605,7 @@ impl cosmic::Application for AppModel {
             Message::UpdateConfig(c) => self.config = c,
             Message::StatusUpdated(mut st) => {
                 if self.config.offline_enabled {
-                    st.recent = with_deletions(st.recent, &self.offline.deletions);
+                    st.recent = with_changes(st.recent, &self.offline.changes);
                 }
                 self.status = Some(st);
                 self.fetching = false;
@@ -802,7 +820,7 @@ mod tests {
             error: None,
             direction: None,
             times: 1,
-            deleted: None,
+            kind: None,
         }
     }
 
@@ -829,34 +847,46 @@ mod tests {
     }
 
     #[test]
-    fn deletions_are_merged_into_history_by_time() {
+    fn offline_changes_are_merged_into_history_by_time() {
         let recent = vec![
             done("new.bin", 1, Some("2026-11-02T12:00:00Z")),
             done("old.bin", 1, Some("2026-11-02T10:00:00Z")),
         ];
-        let at = ts("2026-11-02T11:00:00Z").as_second();
-        let dels = [Deletion {
-            at,
+        let changes = [Change {
+            at: ts("2026-11-02T11:00:00Z").as_second(),
             path: "Games/GCS/x.eqp".into(),
-            deleted_in: DeletedIn::Here,
+            size: 7,
+            kind: ChangeKind::Updated,
+            direction: Direction::Upload,
         }];
-        let merged = with_deletions(recent.clone(), &dels);
+        let merged = with_changes(recent.clone(), &changes);
         let names: Vec<&str> = merged.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["new.bin", "Games/GCS/x.eqp", "old.bin"]);
-        assert_eq!(merged[1].deleted, Some(DeletedIn::Here));
-        assert_eq!(with_deletions(recent.clone(), &[]), recent);
+        assert_eq!(merged[1].kind, Some(ChangeKind::Updated));
+        assert_eq!(merged[1].direction, Some(Direction::Upload));
+        assert_eq!(merged[1].size, 7);
+        assert_eq!(with_changes(recent.clone(), &[]), recent);
     }
 
     #[test]
-    fn deleted_rows_say_where_the_delete_happened() {
-        let now = ts("2026-11-02T12:00:00Z");
-        let mut t = done("Games/a.eqp", -1, Some("2026-11-02T11:55:00Z"));
-        t.deleted = Some(DeletedIn::Here);
-        assert_eq!(recent_caption(&t, now), "Games · Deleted here · 5m ago");
-        t.deleted = Some(DeletedIn::Cloud);
+    fn icons_explain_kind_and_direction() {
+        assert_eq!(kind_icon(ChangeKind::Created).1, "New file");
+        assert_eq!(kind_icon(ChangeKind::Deleted).0, "user-trash-symbolic");
         assert_eq!(
-            recent_caption(&t, now),
-            "Games · Deleted in the cloud · 5m ago"
+            direction_tip(Direction::Upload, None),
+            "Uploaded to the cloud"
+        );
+        assert_eq!(
+            direction_tip(Direction::Download, Some(ChangeKind::Created)),
+            "Downloaded from the cloud"
+        );
+        assert_eq!(
+            direction_tip(Direction::Upload, Some(ChangeKind::Deleted)),
+            "Deleted here, so removed from the cloud"
+        );
+        assert_eq!(
+            direction_tip(Direction::Download, Some(ChangeKind::Deleted)),
+            "Deleted in the cloud, so removed here"
         );
     }
 

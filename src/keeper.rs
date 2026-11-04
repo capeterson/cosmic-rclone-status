@@ -14,7 +14,7 @@
 use crate::config::{expand, Config};
 use crate::conflict::{self, Remote};
 use crate::pin::{self, OfflineState, Phase, PinState, Step};
-use crate::rc;
+use crate::rc::{self, ChangeKind, Direction};
 use crate::units;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -147,19 +147,6 @@ impl Pending {
         deletes_ok(self.gone_remote.len(), self.had_remote)
             && deletes_ok(self.gone_local.len(), self.had_local)
     }
-
-    /// What the sync removes, as it will show in recent activity.
-    fn deletions(&self) -> Vec<(pin::DeletedIn, String)> {
-        let here = self
-            .gone_local
-            .iter()
-            .map(|p| (pin::DeletedIn::Here, p.clone()));
-        let cloud = self
-            .gone_remote
-            .iter()
-            .map(|p| (pin::DeletedIn::Cloud, p.clone()));
-        here.chain(cloud).collect()
-    }
 }
 
 /// bisync's own default limit: refuse when more than this share of a side was deleted.
@@ -171,13 +158,111 @@ fn deletes_ok(deleted: usize, had: usize) -> bool {
     deleted <= DELETE_FLOOR || deleted * 100 <= had * MAX_DELETE_PERCENT
 }
 
-/// Run bisync for one folder. Returns the deletions it applied.
-fn bisync(
-    cfg: &Config,
-    remote: &str,
-    local: &Path,
-    resync: bool,
-) -> Result<Vec<(pin::DeletedIn, String)>, String> {
+// ---- what a sync changed, for recent activity ----
+
+/// Files as path → (size, modified time in ms).
+type Files = HashMap<String, (i64, i64)>;
+
+/// A listing file's entries with their size and time (`- size hash - time "path"`).
+fn listing_files(file: &Path) -> Option<Files> {
+    let parse = |line: &str| {
+        let mut f = line.split_whitespace();
+        let size = f.nth(1)?.parse().ok()?;
+        let time = f.nth(2)?;
+        let ms = jiff::fmt::strtime::parse("%Y-%m-%dT%H:%M:%S%.f%z", time)
+            .and_then(|t| t.to_timestamp())
+            .ok()?
+            .as_millisecond();
+        Some((size, ms))
+    };
+    Some(
+        read_listing(file)?
+            .into_iter()
+            .filter_map(|(path, line)| Some((path, parse(&line)?)))
+            .collect(),
+    )
+}
+
+/// What's in the local copy right now.
+fn local_files(root: &Path) -> Files {
+    fn walk(dir: &Path, rel: &str, out: &mut Files) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                walk(&e.path(), &child, out);
+            } else {
+                let ms = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                out.insert(child, (i64::try_from(md.len()).unwrap_or(-1), ms));
+            }
+        }
+    }
+    let mut out = Files::new();
+    walk(root, "", &mut out);
+    out
+}
+
+/// The same file content as far as a listing can tell (size, and time to the millisecond).
+fn same(a: (i64, i64), b: (i64, i64)) -> bool {
+    a.0 == b.0 && (a.1 - b.1).abs() <= 1
+}
+
+/// Bisync's conflict copies; conflicts get their own notices instead.
+fn is_conflict_copy(path: &str) -> bool {
+    path.ends_with(conflict::P1) || path.ends_with(conflict::P2)
+}
+
+/// What a sync did, from three views of the local copy: as of the last sync (`synced`, bisync's
+/// listing), just before this sync (`before`), and after it (`after`). Changes between `synced`
+/// and `before` were made here and went up; changes between `before` and `after` came down.
+/// Returns (kind, direction, path, size), sorted by path.
+fn classify_changes(
+    synced: &Files,
+    before: &Files,
+    after: &Files,
+) -> Vec<(ChangeKind, Direction, String, i64)> {
+    let mut out = vec![];
+    let mut diff = |old: &Files, new: &Files, dir: Direction| {
+        for (p, &now) in new {
+            match old.get(p) {
+                None => out.push((ChangeKind::Created, dir, p.clone(), now.0)),
+                Some(&was) if !same(was, now) => {
+                    out.push((ChangeKind::Updated, dir, p.clone(), now.0));
+                }
+                Some(_) => {}
+            }
+        }
+        for p in old.keys().filter(|p| !new.contains_key(*p)) {
+            out.push((ChangeKind::Deleted, dir, p.clone(), -1));
+        }
+    };
+    diff(synced, before, Direction::Upload);
+    diff(before, after, Direction::Download);
+    // A file in conflict shows up as gone and as two renamed copies; leave all that to the
+    // conflict notice.
+    let conflicted: HashSet<String> = after
+        .keys()
+        .filter_map(|p| p.strip_suffix(conflict::P1).map(str::to_string))
+        .collect();
+    out.retain(|(_, _, p, _)| !is_conflict_copy(p) && !conflicted.contains(p));
+    out.sort_by(|a, b| (&a.2, a.1 as u8).cmp(&(&b.2, b.1 as u8)));
+    out
+}
+
+/// Run bisync for one folder.
+fn bisync(cfg: &Config, remote: &str, local: &Path, resync: bool) -> Result<(), String> {
     // Jobs run inside rclone, so one started by an earlier keeper (before a restart or an
     // upgrade) can still be going. Never run a second one alongside it.
     if running_jobs(cfg) > 0 {
@@ -213,15 +298,15 @@ const ALL_CHANGED: &str = "all files were changed";
 /// bisync's "too many deletes" safety abort.
 const TOO_MANY_DELETES: &str = "too many deletes";
 
-/// Run bisync and return the deletions it applied. Works around two rclone 1.60 rc quirks (see
-/// below) by re-running with `force` once this code has made the safety checks itself.
+/// Run bisync. Works around two rclone 1.60 rc quirks (see below) by re-running with `force`
+/// once this code has made the safety checks itself.
 fn bisync_in(
     cfg: &Config,
     remote: &str,
     local: &Path,
     workdir: &Path,
     resync: bool,
-) -> Result<Vec<(pin::DeletedIn, String)>, String> {
+) -> Result<(), String> {
     let run = |force: bool| {
         let mut p = json!({
             "path1": remote,
@@ -239,9 +324,7 @@ fn bisync_in(
         rc_job(cfg, "sync/bisync", p).map(|_| ())
     };
     match run(false) {
-        // With rclone 1.60 through rc, any deletion aborts (below), so a run that succeeds
-        // first time deleted nothing.
-        Ok(()) => Ok(vec![]),
+        Ok(()) => Ok(()),
         // Through rc, rclone 1.60 leaves bisync's delete limit at 0% (the `maxDelete` parameter
         // sets a different field), so any deletion aborts. The abort comes before anything is
         // applied and leaves both sides' listings, so apply bisync's usual limit here instead.
@@ -258,13 +341,13 @@ fn bisync_in(
                     pending.had_local,
                 ));
             }
-            run(true).map(|()| pending.deletions())
+            run(true)
         }
         // This check guards against every timestamp shifting at once (a FAT disk after a DST
         // change); here it mostly fires on small folders where the one file was edited. It
         // aborts before anything is applied and only after the delete check has passed (so
         // nothing was deleted), and repeating with `force` deletes nothing more.
-        Err(e) if e.contains(ALL_CHANGED) => run(true).map(|()| vec![]),
+        Err(e) if e.contains(ALL_CHANGED) => run(true),
         Err(e) => Err(e),
     }
 }
@@ -520,18 +603,39 @@ impl Keeper {
     fn sync_once(&mut self, rel: &str, local: &Path, resync: bool) -> Result<(), String> {
         std::fs::create_dir_all(local).map_err(|e| e.to_string())?;
         let remote = self.remote_for(rel)?;
-        let deleted = bisync(&self.cfg, &remote, local, resync)?;
-        self.record_deletions(rel, deleted);
+        self.bisync_recorded(rel, &remote, local, resync)?;
         self.resolve_conflicts(rel, &remote, local)
     }
 
-    /// Note each deletion a sync applied, for the recent-activity list.
-    fn record_deletions(&mut self, rel: &str, deleted: Vec<(pin::DeletedIn, String)>) {
-        let at = now();
-        for (deleted_in, path) in deleted {
-            self.state
-                .record_deletion(at, format!("{rel}/{path}"), deleted_in);
+    /// bisync, noting what it changed for the recent-activity list. A resync (the first download,
+    /// or a repair) isn't recorded: it would list every file in the folder.
+    fn bisync_recorded(
+        &mut self,
+        rel: &str,
+        remote: &str,
+        local: &Path,
+        resync: bool,
+    ) -> Result<(), String> {
+        let synced = (!resync)
+            .then(|| listing_file(&pin::workdir(), local, ".path2.lst"))
+            .flatten()
+            .and_then(|f| listing_files(&f));
+        let before = synced.as_ref().map(|_| local_files(local));
+        bisync(&self.cfg, remote, local, resync)?;
+        if let (Some(synced), Some(before)) = (synced, before) {
+            let at = now();
+            let after = local_files(local);
+            for (kind, direction, path, size) in classify_changes(&synced, &before, &after) {
+                self.state.record_change(pin::Change {
+                    at,
+                    path: format!("{rel}/{path}"),
+                    size,
+                    kind,
+                    direction,
+                });
+            }
         }
+        Ok(())
     }
 
     fn failed(&mut self, rel: &str, err: &str, was_resync: bool) {
@@ -631,15 +735,13 @@ impl Keeper {
                     Some("Waiting for a connection to upload the last changes".into());
                 return;
             }
-            let pushed = self
-                .remote_for(rel)
-                .and_then(|remote| bisync(&self.cfg, &remote, &local, false));
-            match pushed {
-                Ok(deleted) => self.record_deletions(rel, deleted),
-                Err(e) => {
-                    self.pin(rel).error = Some(format!("Couldn't upload the last changes: {e}"));
-                    return;
-                }
+            let pushed = match self.remote_for(rel) {
+                Ok(remote) => self.bisync_recorded(rel, &remote, &local, false),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = pushed {
+                self.pin(rel).error = Some(format!("Couldn't upload the last changes: {e}"));
+                return;
             }
         }
         let unit = units::pin_unit_name(&pin::pin_id(rel));
@@ -829,9 +931,36 @@ mod tests {
         std::fs::write(r.join("sub/keep.txt"), "k").unwrap();
         run(true).unwrap();
         std::fs::remove_file(l.join("sub/a.txt")).unwrap();
-        let deleted = run(false).unwrap();
+        std::fs::write(l.join("sub/new.txt"), "n").unwrap();
+        std::fs::write(r.join("sub/keep.txt"), "k2").unwrap();
+        let synced = listing_files(&listing_file(&wd, &l, ".path2.lst").unwrap()).unwrap();
+        let before = local_files(&l);
+        run(false).unwrap();
         assert!(!r.join("sub/a.txt").exists());
-        assert_eq!(deleted, [(pin::DeletedIn::Here, "sub/a.txt".to_string())]);
+        let changes = classify_changes(&synced, &before, &local_files(&l));
+        assert_eq!(
+            changes,
+            [
+                (
+                    ChangeKind::Deleted,
+                    Direction::Upload,
+                    "sub/a.txt".to_string(),
+                    -1
+                ),
+                (
+                    ChangeKind::Updated,
+                    Direction::Download,
+                    "sub/keep.txt".to_string(),
+                    2
+                ),
+                (
+                    ChangeKind::Created,
+                    Direction::Upload,
+                    "sub/new.txt".to_string(),
+                    1
+                ),
+            ]
+        );
     }
 
     /// A listing file in bisync's format.
@@ -875,15 +1004,60 @@ mod tests {
         assert_eq!(p.gone_remote, ["a"]);
         assert_eq!(p.gone_local, ["sub/c d.txt"]);
         assert_eq!((p.had_remote, p.had_local), (4, 4));
-        assert_eq!(
-            p.deletions(),
-            [
-                (pin::DeletedIn::Here, "sub/c d.txt".to_string()),
-                (pin::DeletedIn::Cloud, "a".to_string())
-            ]
-        );
         assert!(p.within_limit());
         assert_eq!(Pending::read(&wd, Path::new("/elsewhere")), None);
+        std::fs::remove_dir_all(wd).ok();
+    }
+
+    #[test]
+    fn classifies_what_each_side_changed() {
+        let files = |e: &[(&str, i64, i64)]| -> Files {
+            e.iter()
+                .map(|(p, s, t)| ((*p).to_string(), (*s, *t)))
+                .collect()
+        };
+        // As of the last sync.
+        let synced = files(&[("a", 1, 100), ("b", 1, 100), ("c", 1, 100), ("d", 1, 100)]);
+        // Here, before this sync: "a" edited, "b" deleted, "n" new.
+        let before = files(&[("a", 2, 200), ("c", 1, 100), ("d", 1, 100), ("n", 1, 300)]);
+        // After: the cloud's "c" came down changed, "d" was deleted in the cloud, "m" is new
+        // from the cloud, and "x" was in conflict.
+        let mut after = files(&[("a", 2, 200), ("c", 3, 400), ("n", 1, 300), ("m", 5, 500)]);
+        after.insert("x..path1".into(), (1, 1));
+        after.insert("x..path2".into(), (1, 1));
+        let got = classify_changes(&synced, &before, &after);
+        let want = [
+            (ChangeKind::Updated, Direction::Upload, "a", 2),
+            (ChangeKind::Deleted, Direction::Upload, "b", -1),
+            (ChangeKind::Updated, Direction::Download, "c", 3),
+            (ChangeKind::Deleted, Direction::Download, "d", -1),
+            (ChangeKind::Created, Direction::Download, "m", 5),
+            (ChangeKind::Created, Direction::Upload, "n", 1),
+        ];
+        let want: Vec<_> = want
+            .iter()
+            .map(|(k, d, p, s)| (*k, *d, (*p).to_string(), *s))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn reads_size_and_time_from_listings() {
+        let wd = std::env::temp_dir().join(format!("rcs-lstf-{}", std::process::id()));
+        std::fs::create_dir_all(&wd).unwrap();
+        let f = wd.join("x.path2.lst");
+        std::fs::write(
+            &f,
+            "# bisync listing v1 from 2026-11-04T05:13:09+0000\n\
+             -  4637802 md5:0d74 - 2026-10-30T02:46:00.251000000+0000 \"One Page/a b.pdf\"\n",
+        )
+        .unwrap();
+        let got = listing_files(&f).unwrap();
+        let want = jiff::Timestamp::from_second(1_793_328_360)
+            .unwrap()
+            .as_millisecond()
+            + 251;
+        assert_eq!(got["One Page/a b.pdf"], (4_637_802, want));
         std::fs::remove_dir_all(wd).ok();
     }
 

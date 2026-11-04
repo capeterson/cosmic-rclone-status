@@ -4,7 +4,7 @@
 
 use crate::config::{expand, Config};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::HashMap, process::Command, time::Duration};
 
 /// Treat JSON `null` like a missing field.
@@ -31,11 +31,20 @@ pub struct Transfer {
     pub speed: f64,
 }
 
-/// Which way a completed transfer went. Only known when rclone reports `srcFs`/`dstFs`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which way a completed transfer went. Known when rclone reports `srcFs`/`dstFs` (newer
+/// rclone), and for every change the offline-folder keeper records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     Upload,
     Download,
+}
+
+/// What happened to a file. Only known for offline folders: rclone's own history doesn't say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeKind {
+    Created,
+    Updated,
+    Deleted,
 }
 
 /// A finished transfer from `core/transferred`, with repeats of the same file merged.
@@ -53,8 +62,8 @@ pub struct CompletedTransfer {
     pub direction: Option<Direction>,
     /// How many raw entries were merged into this row (>= 1).
     pub times: u32,
-    /// Not a transfer but a deletion synced in an offline folder (see `pin::Deletion`).
-    pub deleted: Option<crate::pin::DeletedIn>,
+    /// Set for changes recorded by the offline-folder keeper (see `pin::Change`).
+    pub kind: Option<ChangeKind>,
 }
 
 /// Newest files kept in the history. rclone itself keeps about this many per stats group.
@@ -74,6 +83,9 @@ struct RawTransferred {
     completed_at: String,
     #[serde(deserialize_with = "null_as_default")]
     error: String,
+    /// The stats group: `job/N` for transfers made by an rc job.
+    #[serde(deserialize_with = "null_as_default")]
+    group: String,
     /// Newer rclone only.
     #[serde(rename = "srcFs")]
     src_fs: Option<String>,
@@ -119,6 +131,9 @@ fn history(raw: Vec<RawTransferred>, cap: usize) -> Vec<CompletedTransfer> {
         .into_iter()
         .enumerate()
         .filter(|(_, r)| !r.checked && !r.name.is_empty())
+        // rc jobs are the offline-folder keeper's syncs, which it records itself with more
+        // detail (and paths from the mount root, not the synced folder).
+        .filter(|(_, r)| !r.group.starts_with("job/"))
         .map(|(i, r)| {
             let at = parse_ts(&r.completed_at).or_else(|| parse_ts(&r.started_at));
             let error = Some(r.error.trim().to_string()).filter(|e| !e.is_empty());
@@ -130,7 +145,7 @@ fn history(raw: Vec<RawTransferred>, cap: usize) -> Vec<CompletedTransfer> {
                 at,
                 error,
                 times: 1,
-                deleted: None,
+                kind: None,
             };
             (i, t)
         })
@@ -938,11 +953,24 @@ other: /home/u/Other fuse.sshfs rw 0 0
     }
 
     #[test]
+    fn offline_folder_jobs_are_left_to_the_keeper() {
+        // The mount's own transfers are in `global_stats`; `job/N` are the keeper's syncs,
+        // which it records itself (with kind, direction and full paths).
+        let r = raw(
+            r#"[{"name":"a","group":"global_stats","completed_at":"2026-11-02T10:00:00Z"},
+                {"name":"GCS/b","group":"job/445","completed_at":"2026-11-02T10:00:00Z"}]"#,
+        );
+        let h = history(r, 10);
+        let names: Vec<&str> = h.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["a"]);
+    }
+
+    #[test]
     fn transferred_parses_a_full_entry() {
         let r = raw(
             r#"[{"name":"Docs/a.txt","size":-1,"bytes":7,"checked":false,
                 "started_at":"2026-11-02T10:00:00-08:00","completed_at":"2026-11-02T10:00:01.123456789-08:00",
-                "error":"boom","group":"job/1","srcFs":"/home/u/.cache/rclone/vfs/gd","dstFs":"gd:"}]"#,
+                "error":"boom","group":"global_stats","srcFs":"/home/u/.cache/rclone/vfs/gd","dstFs":"gd:"}]"#,
         );
         let h = history(r, 10);
         assert_eq!(h.len(), 1);
