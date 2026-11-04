@@ -28,7 +28,7 @@ Defaults (stored in cosmic-config under `com.ca-peterson.CosmicRcloneStatus`):
 | `service` | `rclone-gdrive.service` |
 | `mount_path` | `~/GoogleDrive` |
 | `cache_dir` | `~/.cache/rclone` (rclone's `--cache-dir`; read for per-file cache status) |
-| `context_menu` | `true` (add the "Rclone…" entry to COSMIC Files' right-click menu) |
+| `context_menu` | `true` (add the "rclone…" entry to COSMIC Files' right-click menu) |
 | `offline_enabled` | `false` (offline folders; switch on in Settings) |
 | `pins` | `[]` (folders kept offline, relative to the mount) |
 | `sync_interval_secs` | `300` (how often offline folders sync when nothing changes locally) |
@@ -40,7 +40,7 @@ right-click menu entry.
 
 Like Google Drive's "Available offline": a pinned folder is fully downloaded, kept in sync both
 ways, and works with no connection, right where it is in the Drive folder. Turn it on in
-Settings, then right-click a folder in COSMIC Files → **Rclone…** → **Keep offline**.
+Settings, then right-click a folder in COSMIC Files → **rclone…** → **Keep offline**.
 
 How it works:
 
@@ -88,9 +88,9 @@ See [Known limits](#known-limits) for what offline folders can't do.
 Command line: `--pin PATH`, `--unpin PATH`, `--pins`, `--offline-repair FOLDER`, and
 `--offline-remove` (used by `just uninstall-user`; refuses while folders are pinned).
 
-## Rclone details window
+## rclone details window
 
-Right-click a file or folder in COSMIC Files and choose **Rclone…** (the applet adds this entry
+Right-click a file or folder in COSMIC Files and choose **rclone…** (the applet adds this entry
 to COSMIC Files' `context_actions` config when it starts; COSMIC Files cannot nest custom
 actions in a submenu, so it is one entry that opens this window). Clicking an item in the
 applet's recent-files list opens the same window. It shows:

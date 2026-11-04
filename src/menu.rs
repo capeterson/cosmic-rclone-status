@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! The "Rclone…" window opened from COSMIC Files' right-click menu (`--menu PATH...`).
+//! The "rclone…" window opened from COSMIC Files' right-click menu (`--menu PATH...`).
 //! COSMIC Files can't nest custom actions in a submenu, so it has one entry that launches this
 //! window. It shows the item's sync status, who it is shared with, and the actions that apply.
 //!
@@ -183,7 +183,7 @@ impl cosmic::Application for Menu {
     fn init(mut core: cosmic::Core, flags: Flags) -> (Self, Task) {
         core.window.show_maximize = false;
         core.window.show_minimize = false;
-        core.set_header_title("Rclone".into());
+        core.set_header_title("rclone".into());
         let first = flags.paths.first().cloned().unwrap_or_default();
         let name = Path::new(&first)
             .file_name()

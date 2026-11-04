@@ -34,7 +34,7 @@ fn main() -> cosmic::iced::Result {
     if args.iter().any(|a| a == "--settings") {
         return settings::run(config::Config::load(APP_ID));
     }
-    // `--menu PATH...` is the "Rclone…" window COSMIC Files opens from its right-click menu.
+    // `--menu PATH...` is the "rclone…" window COSMIC Files opens from its right-click menu.
     if let Some(i) = args.iter().position(|a| a == "--menu") {
         return menu::run(config::Config::load(APP_ID), args[i + 1..].to_vec());
     }

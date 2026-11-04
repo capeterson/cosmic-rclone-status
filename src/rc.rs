@@ -553,7 +553,7 @@ fn item_path(mount_path: &str, name: &str) -> Option<String> {
     Some(format!("{mount}/{name}"))
 }
 
-/// Open the "Rclone…" details window for the remote path `name`, as a separate process (the
+/// Open the "rclone…" details window for the remote path `name`, as a separate process (the
 /// same window COSMIC Files' right-click entry opens). Nothing is downloaded.
 pub fn open_details(cfg: &Config, name: &str) {
     let (Some(path), Ok(exe)) = (item_path(&cfg.mount_path, name), std::env::current_exe()) else {

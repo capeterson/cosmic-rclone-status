@@ -376,7 +376,7 @@ impl cosmic::Application for App {
             settings::section()
                 .title("General")
                 .add(
-                    settings::item::builder("Show “Rclone…” in the Files right-click menu")
+                    settings::item::builder("Show “rclone…” in the Files right-click menu")
                         .toggler(self.cfg.context_menu, Message::ToggleContextMenu),
                 )
                 .into(),
@@ -468,7 +468,7 @@ impl App {
         }
         if self.cfg.pins.is_empty() {
             sec = sec.add(settings::item::builder("No folders are kept offline yet").description(
-                "In Files, right-click a folder in the Drive folder, choose “Rclone…”, then \
+                "In Files, right-click a folder in the Drive folder, choose “rclone…”, then \
                  “Keep offline”.",
             ).control(widget::Space::new()));
         }

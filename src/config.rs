@@ -16,7 +16,7 @@ pub struct Config {
     pub mount_path: String,
     /// rclone's `--cache-dir` (`~` is expanded); read for per-file cache status.
     pub cache_dir: String,
-    /// Add an "Rclone…" entry to the COSMIC Files right-click menu.
+    /// Add an "rclone…" entry to the COSMIC Files right-click menu.
     pub context_menu: bool,
     /// Offline folders are switched on (set up from the settings window).
     pub offline_enabled: bool,
