@@ -60,7 +60,33 @@ fn rc_job(cfg: &Config, method: &str, mut params: Value) -> Result<Value, String
 }
 
 fn bisync(cfg: &Config, remote: &str, local: &Path, resync: bool) -> Result<(), String> {
+    // Jobs run inside rclone, so one started by an earlier keeper (before a restart or an
+    // upgrade) can still be going. Never run a second one alongside it.
+    if running_jobs(cfg) > 0 {
+        return Err(EARLIER_SYNC_RUNNING.into());
+    }
     bisync_in(cfg, remote, local, &pin::workdir(), resync)
+}
+
+const EARLIER_SYNC_RUNNING: &str = "An earlier sync is still finishing";
+
+/// How many rc jobs rclone is still running. This keeper is what starts async jobs on the
+/// mount's rclone, so any running job is a sync it started. Unknown counts as none: if rclone
+/// can't be asked, the sync itself fails anyway.
+fn running_jobs(cfg: &Config) -> usize {
+    let Ok(list) = rc::rc_request(cfg, "job/list", &json!({})) else {
+        return 0;
+    };
+    list.get("jobids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_i64)
+        .filter(|id| {
+            rc::rc_request(cfg, "job/status", &json!({ "jobid": id }))
+                .is_ok_and(|s| s.get("finished").and_then(Value::as_bool) == Some(false))
+        })
+        .count()
 }
 
 /// bisync's "all files were changed" safety abort.
@@ -319,12 +345,16 @@ impl Keeper {
         {
             let p = self.pin(rel);
             p.last_attempt = started;
+            p.syncing = true;
             if !p.initialized {
                 p.phase = Phase::Downloading;
             }
         }
+        // Written now so the UI can show the sync while it runs.
         self.save();
-        match self.sync_once(rel, &local, resync) {
+        let result = self.sync_once(rel, &local, resync);
+        self.pin(rel).syncing = false;
+        match result {
             Ok(()) => {
                 self.synced_print
                     .insert(rel.to_string(), fingerprint(&local));
@@ -360,9 +390,10 @@ impl Keeper {
                 self.sync(rel, true);
             }
             Failure::StaleLock(lock) => {
-                // This keeper is the only one using the workdir, and its own job has finished,
-                // so the lock is left over from a run that was cut off.
-                if lock.starts_with(pin::workdir()) {
+                // Only this keeper uses the workdir and its own job has finished, so unless rclone
+                // is still running a job (one started before the keeper restarted), the lock is
+                // left over from a run that was cut off.
+                if lock.starts_with(pin::workdir()) && running_jobs(&self.cfg) == 0 {
                     let _ = std::fs::remove_file(lock);
                 }
                 let p = self.pin(rel);
@@ -506,6 +537,11 @@ pub fn run() -> ! {
         state: OfflineState::load(),
         synced_print: HashMap::new(),
     };
+    // A sync that was running when the keeper last stopped isn't running any more.
+    for p in &mut k.state.pins {
+        p.syncing = false;
+    }
+    k.save();
     loop {
         k.cycle();
         std::thread::sleep(CYCLE);
@@ -686,15 +722,35 @@ mod tests {
         let err = bisync(&cfg, "gdrive,skip_gdocs=true:Work", Path::new("/l"), true).unwrap_err();
         assert_eq!(err, "bisync aborted");
         let reqs = s.requests();
-        let body: Value = serde_json::from_str(&reqs[0].body).unwrap();
+        let start = reqs.iter().find(|r| r.path() == "/sync/bisync").unwrap();
+        let body: Value = serde_json::from_str(&start.body).unwrap();
         assert_eq!(body["path1"], "gdrive,skip_gdocs=true:Work");
         assert_eq!(body["path2"], "/l");
         assert_eq!(body["checkSync"], "true");
         assert_eq!(body["resync"], true);
         assert_eq!(body["_async"], true);
+        let status = reqs.iter().rfind(|r| r.path() == "/job/status").unwrap();
         assert_eq!(
-            serde_json::from_str::<Value>(&reqs[1].body).unwrap()["jobid"],
+            serde_json::from_str::<Value>(&status.body).unwrap()["jobid"],
             7
         );
+    }
+
+    #[test]
+    fn a_job_still_running_in_rclone_blocks_a_second_sync() {
+        use crate::testutil::{ok, FakeServer};
+        let s = FakeServer::start(vec![
+            ok("/job/list", r#"{"jobids":[3]}"#),
+            ok("/job/status", r#"{"finished":false}"#),
+        ]);
+        let cfg = Config {
+            rc_addr: s.addr.clone(),
+            env_file: "/nonexistent".into(),
+            ..Config::default()
+        };
+        assert_eq!(running_jobs(&cfg), 1);
+        let err = bisync(&cfg, "r:x", Path::new("/l"), false).unwrap_err();
+        assert_eq!(err, EARLIER_SYNC_RUNNING);
+        assert!(!s.paths().contains(&"/sync/bisync".to_string()));
     }
 }

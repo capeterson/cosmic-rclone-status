@@ -199,6 +199,23 @@ fn offline_line(pins: &[String], state: &OfflineState) -> String {
     }
 }
 
+/// The active transfers: a caption and a full-width progress bar each, up to 8.
+fn transfer_rows(st: &Status) -> Element<'_, Message> {
+    let mut col = widget::Column::new().spacing(8).width(Length::Fill);
+    for t in st.transfers.iter().take(8) {
+        col = col
+            .push(widget::text::caption(transfer_line(t)))
+            .push(widget::determinate_linear(t.percentage as f32 / 100.0).width(Length::Fill));
+    }
+    if st.transfers.len() > 8 {
+        col = col.push(widget::text::caption(format!(
+            "…and {} more",
+            st.transfers.len() - 8
+        )));
+    }
+    col.into()
+}
+
 /// One line describing a transfer. `size` is negative when rclone doesn't know it.
 fn transfer_line(t: &rc::Transfer) -> String {
     let total = if t.size < 0 {
@@ -375,17 +392,9 @@ impl AppModel {
 
         if let Some(st) = &self.status {
             if !st.transfers.is_empty() {
-                col = col.push(widget::divider::horizontal::default());
-                for t in st.transfers.iter().take(8) {
-                    col = col.push(widget::text::caption(transfer_line(t)));
-                    col = col.push(widget::determinate_linear(t.percentage as f32 / 100.0));
-                }
-                if st.transfers.len() > 8 {
-                    col = col.push(widget::text::caption(format!(
-                        "…and {} more",
-                        st.transfers.len() - 8
-                    )));
-                }
+                col = col
+                    .push(widget::divider::horizontal::default())
+                    .push(transfer_rows(st));
             }
             col = col.push(widget::divider::horizontal::default());
             let mut header = widget::Row::new()

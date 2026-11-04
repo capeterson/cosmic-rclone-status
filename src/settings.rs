@@ -476,13 +476,13 @@ impl App {
         for rel in &self.cfg.pins {
             let p = self.state.pin(rel);
             let phase = p.map_or(Phase::Downloading, |p| p.phase);
-            let mut desc = phase.label().to_string();
-            if let Some(t) = p.and_then(|p| p.last_sync) {
+            let mut desc = pin::describe(p, None);
+            if let Some(t) = p
+                .and_then(|p| p.last_sync)
+                .filter(|_| !p.is_some_and(|p| p.syncing))
+            {
                 let when = crate::app::ago(now, jiff::Timestamp::from_second(t).ok());
                 desc = format!("{desc} · synced {when}");
-            }
-            if let Some(e) = p.and_then(|p| p.error.as_deref()) {
-                desc = format!("{desc}\n{e}");
             }
             let mut buttons = widget::row::with_capacity(3).spacing(8);
             if phase == Phase::Attention {

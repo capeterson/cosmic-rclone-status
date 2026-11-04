@@ -195,6 +195,57 @@ pub struct PinState {
     /// Failed attempts in a row.
     pub failures: u32,
     pub error: Option<String>,
+    /// A sync is running right now.
+    pub syncing: bool,
+}
+
+/// How much of a folder's local copy is on disk: (files, bytes).
+pub fn local_usage(rel: &str) -> (u64, u64) {
+    fn walk(dir: &Path, acc: &mut (u64, u64)) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                walk(&e.path(), acc);
+            } else {
+                acc.0 += 1;
+                acc.1 += md.len();
+            }
+        }
+    }
+    let mut acc = (0, 0);
+    walk(&local_dir(rel), &mut acc);
+    acc
+}
+
+/// One line describing a pinned folder's state for the UI, e.g. "Downloading for offline use ·
+/// 12 files (3.0 MiB) so far" or "Syncing…". `usage` is from [`local_usage`], when measured.
+pub fn describe(p: Option<&PinState>, usage: Option<(u64, u64)>) -> String {
+    let Some(p) = p else {
+        return "Waiting to start…".into();
+    };
+    let files = |(n, b): (u64, u64)| {
+        let s = if n == 1 { "" } else { "s" };
+        format!("{n} file{s} ({})", crate::status::human_bytes(b))
+    };
+    let mut line = match (p.phase, p.syncing) {
+        (Phase::Downloading, _) => match usage {
+            Some(u) if u.0 > 0 => format!("{} · {} so far", p.phase.label(), files(u)),
+            _ => p.phase.label().to_string(),
+        },
+        (Phase::Ready | Phase::Waiting, true) => "Syncing…".to_string(),
+        (Phase::Ready, false) => match usage {
+            Some(u) => format!("{} · {}", p.phase.label(), files(u)),
+            None => p.phase.label().to_string(),
+        },
+        (phase, _) => phase.label().to_string(),
+    };
+    if let Some(e) = &p.error {
+        line = format!("{line}: {e}");
+    }
+    line
 }
 
 /// Something the user should hear about once, e.g. a resolved conflict.
@@ -485,6 +536,31 @@ mod tests {
         }
         assert_eq!(s.notices.len(), NOTICES_KEPT);
         assert_eq!(s.notices[0].text, "5");
+    }
+
+    #[test]
+    fn describe_follows_the_keeper() {
+        assert_eq!(describe(None, None), "Waiting to start…");
+        let mut p = PinState {
+            rel: "a".into(),
+            ..PinState::default()
+        };
+        assert_eq!(describe(Some(&p), None), "Downloading for offline use");
+        assert_eq!(
+            describe(Some(&p), Some((12, 3 * 1024 * 1024))),
+            "Downloading for offline use · 12 files (3.0 MiB) so far"
+        );
+        p.phase = Phase::Ready;
+        p.syncing = true;
+        assert_eq!(describe(Some(&p), Some((1, 5))), "Syncing…");
+        p.syncing = false;
+        assert_eq!(
+            describe(Some(&p), Some((1, 5))),
+            "Available offline · 1 file (5.0 B)"
+        );
+        p.phase = Phase::Waiting;
+        p.error = Some("no network".into());
+        assert_eq!(describe(Some(&p), None), "Waiting to sync: no network");
     }
 
     #[test]
