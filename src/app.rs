@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::mime_icon;
-use crate::pin::{self, OfflineState};
+use crate::pin::{self, DeletedIn, Deletion, OfflineState};
 use crate::rc::{self, human, CompletedTransfer, Direction, Health, Status};
 use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
@@ -259,6 +259,11 @@ fn recent_caption(t: &CompletedTransfer, now: jiff::Timestamp) -> String {
     if !dir.is_empty() {
         parts.push(dir.to_string());
     }
+    match t.deleted {
+        Some(DeletedIn::Here) => parts.push("Deleted here".into()),
+        Some(DeletedIn::Cloud) => parts.push("Deleted in the cloud".into()),
+        None => {}
+    }
     if t.size >= 0 {
         parts.push(human(t.size as f64));
     }
@@ -270,6 +275,29 @@ fn recent_caption(t: &CompletedTransfer, now: jiff::Timestamp) -> String {
         parts.push(format!("×{}", t.times));
     }
     parts.join(" · ")
+}
+
+/// rclone's transfer history with offline-folder deletions mixed in, newest first. rclone
+/// records no deletions, so these come from the keeper (`offline.json`).
+fn with_deletions(recent: Vec<CompletedTransfer>, dels: &[Deletion]) -> Vec<CompletedTransfer> {
+    if dels.is_empty() {
+        return recent;
+    }
+    let mut all = recent;
+    all.extend(dels.iter().map(|d| CompletedTransfer {
+        name: d.path.clone(),
+        size: -1,
+        bytes: 0,
+        at: jiff::Timestamp::from_second(d.at).ok(),
+        error: None,
+        direction: None,
+        times: 1,
+        deleted: Some(d.deleted_in),
+    }));
+    // Stable, so rclone's own order holds among equal times; unknown times go last.
+    all.sort_by_key(|t| std::cmp::Reverse(t.at));
+    all.truncate(rc::HISTORY_CAP);
+    all
 }
 
 /// Why the history list is empty, in words.
@@ -322,8 +350,16 @@ fn recent_row(t: &CompletedTransfer, now: jiff::Timestamp, detailed: bool) -> El
     if t.error.is_some() {
         row = row.push(emblem(include_bytes!("../resources/emblems/error.svg")));
     }
+    if t.deleted.is_some() {
+        row = row.push(widget::icon::from_name("user-trash-symbolic").size(16));
+    }
     widget::button::custom(row)
-        .on_press(Message::OpenDetails(t.name.clone()))
+        // A deleted file has no details to show.
+        .on_press_maybe(
+            t.deleted
+                .is_none()
+                .then(|| Message::OpenDetails(t.name.clone())),
+        )
         .class(cosmic::theme::Button::MenuItem)
         .width(Length::Fill)
         .padding([4, 8])
@@ -549,7 +585,10 @@ impl cosmic::Application for AppModel {
     fn update(&mut self, message: Message) -> Task<cosmic::Action<Message>> {
         match message {
             Message::UpdateConfig(c) => self.config = c,
-            Message::StatusUpdated(st) => {
+            Message::StatusUpdated(mut st) => {
+                if self.config.offline_enabled {
+                    st.recent = with_deletions(st.recent, &self.offline.deletions);
+                }
                 self.status = Some(st);
                 self.fetching = false;
                 return self.sync_history();
@@ -763,6 +802,7 @@ mod tests {
             error: None,
             direction: None,
             times: 1,
+            deleted: None,
         }
     }
 
@@ -786,6 +826,38 @@ mod tests {
         assert_eq!(split_path("a/b/c.txt"), ("a/b", "c.txt"));
         assert_eq!(split_path("c.txt"), ("", "c.txt"));
         assert_eq!(split_path("a/b/"), ("a", "b"));
+    }
+
+    #[test]
+    fn deletions_are_merged_into_history_by_time() {
+        let recent = vec![
+            done("new.bin", 1, Some("2026-11-02T12:00:00Z")),
+            done("old.bin", 1, Some("2026-11-02T10:00:00Z")),
+        ];
+        let at = ts("2026-11-02T11:00:00Z").as_second();
+        let dels = [Deletion {
+            at,
+            path: "Games/GCS/x.eqp".into(),
+            deleted_in: DeletedIn::Here,
+        }];
+        let merged = with_deletions(recent.clone(), &dels);
+        let names: Vec<&str> = merged.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["new.bin", "Games/GCS/x.eqp", "old.bin"]);
+        assert_eq!(merged[1].deleted, Some(DeletedIn::Here));
+        assert_eq!(with_deletions(recent.clone(), &[]), recent);
+    }
+
+    #[test]
+    fn deleted_rows_say_where_the_delete_happened() {
+        let now = ts("2026-11-02T12:00:00Z");
+        let mut t = done("Games/a.eqp", -1, Some("2026-11-02T11:55:00Z"));
+        t.deleted = Some(DeletedIn::Here);
+        assert_eq!(recent_caption(&t, now), "Games · Deleted here · 5m ago");
+        t.deleted = Some(DeletedIn::Cloud);
+        assert_eq!(
+            recent_caption(&t, now),
+            "Games · Deleted in the cloud · 5m ago"
+        );
     }
 
     #[test]

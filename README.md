@@ -79,9 +79,11 @@ drop-in for the mount's service (`<service>.d/50-cosmic-rclone-status.conf`) tha
 can't open your files, and restarts the mount once. Turning offline folders off removes the
 services and the drop-in; the `/etc/fuse.conf` line is left in place.
 
-Limits: folders only (not single files), and not nested inside each other; moving a file into or
-out of an offline folder is a copy plus a delete (it crosses mounts); very long folder paths are
-refused because rclone 1.60's bisync can't name its working files.
+Deletions bisync applies are shown in the popup's recent activity, marked *Deleted here* (removed
+from the cloud) or *Deleted in the cloud* (removed here). A sync that would delete more than half
+of a folder's files (and more than 3) stops with **Needs attention** instead.
+
+See [Known limits](#known-limits) for what offline folders can't do.
 
 Command line: `--pin PATH`, `--unpin PATH`, `--pins`, `--offline-repair FOLDER`, and
 `--offline-remove` (used by `just uninstall-user`; refuses while folders are pinned).
@@ -132,6 +134,20 @@ jump on every poll. Newer rclone versions report each transfer's source and dest
 they do, rows get an upload or download arrow. Older versions (such as 1.60) show no arrow.
 File icons are chosen from the file name alone (shared-mime-info plus your icon theme); files
 are never read, so nothing is downloaded to draw the list.
+
+## Known limits
+
+- **Deletions only show for offline folders.** rclone keeps no record of deleted files: they are
+  not in its transfer history and are only logged at debug level. So the recent-activity list
+  shows deletions only when an offline folder's sync applies them. Files deleted elsewhere in the
+  Drive folder (or on another device) don't appear.
+- **Offline folders are folders only**, can't be nested inside each other, and very long folder
+  paths are refused (rclone 1.60's bisync names its working files after both full paths).
+- **Moving a file into or out of an offline folder** is a copy plus a delete, because it crosses
+  mounts.
+- **rclone 1.60 workarounds**: through the rc API, bisync's delete limit is stuck at 0% and its
+  "all files changed" check trips on small folders, so the keeper makes those checks itself (at
+  most half of a folder, or 3 files, deleted per sync) and then runs bisync with `force`.
 
 ## License
 

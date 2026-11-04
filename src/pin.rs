@@ -242,7 +242,8 @@ pub fn describe(p: Option<&PinState>, usage: Option<(u64, u64)>) -> String {
         },
         (phase, _) => phase.label().to_string(),
     };
-    if let Some(e) = &p.error {
+    // While a sync runs, the error is the last attempt's and may no longer apply.
+    if let Some(e) = p.error.as_deref().filter(|_| !p.syncing) {
         line = format!("{line}: {e}");
     }
     line
@@ -265,11 +266,46 @@ pub struct OfflineState {
     pub pins: Vec<PinState>,
     /// Newest last; trimmed to [`NOTICES_KEPT`].
     pub notices: Vec<Notice>,
+    /// Deletions synced in offline folders, newest last; trimmed to [`ACTIVITY_KEPT`]. rclone
+    /// keeps no record of deletions itself, so this is the only place they show up.
+    pub deletions: Vec<Deletion>,
 }
 
 pub const NOTICES_KEPT: usize = 20;
+pub const ACTIVITY_KEPT: usize = 100;
+
+/// Where a deleted file was deleted. The sync then removed it from the other side.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeletedIn {
+    /// Deleted on this computer; the sync removed it from the cloud.
+    #[default]
+    Here,
+    /// Deleted in the cloud (another device, the web); the sync removed it here.
+    Cloud,
+}
+
+/// A file deleted in an offline folder and synced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Deletion {
+    /// Unix seconds when the sync applied it.
+    pub at: i64,
+    /// Path relative to the mount root, e.g. `Work/Taxes/2024.pdf`.
+    pub path: String,
+    pub deleted_in: DeletedIn,
+}
 
 impl OfflineState {
+    pub fn record_deletion(&mut self, at: i64, path: String, deleted_in: DeletedIn) {
+        self.deletions.push(Deletion {
+            at,
+            path,
+            deleted_in,
+        });
+        let extra = self.deletions.len().saturating_sub(ACTIVITY_KEPT);
+        self.deletions.drain(..extra);
+    }
+
     pub fn pin(&self, rel: &str) -> Option<&PinState> {
         self.pins.iter().find(|p| p.rel == rel)
     }

@@ -53,6 +53,8 @@ pub struct CompletedTransfer {
     pub direction: Option<Direction>,
     /// How many raw entries were merged into this row (>= 1).
     pub times: u32,
+    /// Not a transfer but a deletion synced in an offline folder (see `pin::Deletion`).
+    pub deleted: Option<crate::pin::DeletedIn>,
 }
 
 /// Newest files kept in the history. rclone itself keeps about this many per stats group.
@@ -128,6 +130,7 @@ fn history(raw: Vec<RawTransferred>, cap: usize) -> Vec<CompletedTransfer> {
                 at,
                 error,
                 times: 1,
+                deleted: None,
             };
             (i, t)
         })

@@ -32,9 +32,35 @@ fn now() -> i64 {
 
 // ---- rc jobs ----
 
+/// A failed rc job: its error, and its output if it produced any (bisync returns its log even
+/// when it aborts).
+#[derive(Debug)]
+struct JobFailed {
+    error: String,
+    log: String,
+}
+
+impl From<String> for JobFailed {
+    fn from(error: String) -> Self {
+        JobFailed {
+            error,
+            log: String::new(),
+        }
+    }
+}
+
+/// The `output` text an rc job returned (bisync puts its log there).
+fn job_log(status: &Value) -> String {
+    status
+        .pointer("/output/output")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Run an rc method as an async job and wait for it, so long transfers don't hit the HTTP
-/// timeout. Returns the job's output.
-fn rc_job(cfg: &Config, method: &str, mut params: Value) -> Result<Value, String> {
+/// timeout. Returns the job's status reply.
+fn rc_job_full(cfg: &Config, method: &str, mut params: Value) -> Result<Value, JobFailed> {
     params["_async"] = json!(true);
     let started = rc::rc_request(cfg, method, &params)?;
     let id = started
@@ -47,19 +73,119 @@ fn rc_job(cfg: &Config, method: &str, mut params: Value) -> Result<Value, String
             .map_err(|e| format!("lost contact with rclone during {method}: {e}"))?;
         if st.get("finished").and_then(Value::as_bool) == Some(true) {
             return if st.get("success").and_then(Value::as_bool) == Some(true) {
-                Ok(st.get("output").cloned().unwrap_or(Value::Null))
+                Ok(st)
             } else {
-                Err(st
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("failed")
-                    .to_string())
+                Err(JobFailed {
+                    error: st
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed")
+                        .to_string(),
+                    log: job_log(&st),
+                })
             };
         }
     }
 }
 
-fn bisync(cfg: &Config, remote: &str, local: &Path, resync: bool) -> Result<(), String> {
+fn rc_job(cfg: &Config, method: &str, params: Value) -> Result<Value, String> {
+    rc_job_full(cfg, method, params).map_err(|f| f.error)
+}
+
+// ---- reading bisync's log ----
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// The remote (bisync's Path1).
+    Remote,
+    /// The local copy (Path2).
+    Local,
+}
+
+/// The text after rclone's `LEVEL  : ` log prefix.
+fn message(line: &str) -> &str {
+    line.split_once(" : ").map_or(line, |(_, m)| m).trim()
+}
+
+/// How many files each side had deleted since the last sync, from bisync's per-side summaries
+/// (`Path1:    2 changes:    0 new, … 1 deleted`): (remote, local).
+fn deleted_counts(log: &str) -> (u64, u64) {
+    let mut out = (0, 0);
+    for line in log.lines().map(message) {
+        let side = if line.starts_with("Path1:") {
+            &mut out.0
+        } else if line.starts_with("Path2:") {
+            &mut out.1
+        } else {
+            continue;
+        };
+        if let Some(n) = line
+            .split(',')
+            .find_map(|part| part.trim().strip_suffix(" deleted"))
+            .and_then(|n| n.trim().parse().ok())
+        {
+            *side = n;
+        }
+    }
+    out
+}
+
+/// The deletions bisync applied: which side the file was removed from, and its path in the
+/// folder. Read from the `Do queued deletes on - PathN` sections and their `x: Deleted` lines.
+fn applied_deletes(log: &str) -> Vec<(Side, String)> {
+    let mut out = vec![];
+    let mut side = None;
+    for line in log.lines().map(message) {
+        if line.contains("Do queued deletes on") {
+            side = if line.ends_with("Path1") {
+                Some(Side::Remote)
+            } else if line.ends_with("Path2") {
+                Some(Side::Local)
+            } else {
+                None
+            };
+        } else if line.starts_with("- ") {
+            // Any other step header ends the deletes section.
+            side = None;
+        } else if let (Some(s), Some(path)) = (side, line.strip_suffix(": Deleted")) {
+            out.push((s, path.to_string()));
+        }
+    }
+    out
+}
+
+/// How many files a side had at the last sync: the entries in bisync's listing for it.
+fn listing_count(workdir: &Path, local: &Path, side: Side) -> Option<u64> {
+    let flat = local
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .replace('/', "_");
+    let suffix = match side {
+        Side::Remote => ".path1.lst",
+        Side::Local => ".path2.lst",
+    };
+    let file = std::fs::read_dir(workdir).ok()?.flatten().find(|e| {
+        let n = e.file_name().to_string_lossy().into_owned();
+        n.contains(&flat) && n.ends_with(suffix)
+    })?;
+    let text = std::fs::read_to_string(file.path()).ok()?;
+    Some(
+        text.lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .count() as u64,
+    )
+}
+
+/// bisync's own default limit: refuse when more than this share of a side was deleted.
+const MAX_DELETE_PERCENT: u64 = 50;
+/// ...unless it's only this many files, so emptying a small folder isn't treated as a disaster.
+const DELETE_FLOOR: u64 = 3;
+
+fn deletes_ok(deleted: u64, had: Option<u64>) -> bool {
+    deleted <= DELETE_FLOOR || had.is_some_and(|n| deleted * 100 <= n * MAX_DELETE_PERCENT)
+}
+
+fn bisync(cfg: &Config, remote: &str, local: &Path, resync: bool) -> Result<String, String> {
     // Jobs run inside rclone, so one started by an earlier keeper (before a restart or an
     // upgrade) can still be going. Never run a second one alongside it.
     if running_jobs(cfg) > 0 {
@@ -92,13 +218,18 @@ fn running_jobs(cfg: &Config) -> usize {
 /// bisync's "all files were changed" safety abort.
 const ALL_CHANGED: &str = "all files were changed";
 
+/// bisync's "too many deletes" safety abort.
+const TOO_MANY_DELETES: &str = "too many deletes";
+
+/// Run bisync and return its log. Works around two rclone 1.60 rc quirks (see below) by
+/// re-running with `force` once this code has made the safety checks itself.
 fn bisync_in(
     cfg: &Config,
     remote: &str,
     local: &Path,
     workdir: &Path,
     resync: bool,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let run = |force: bool| {
         let mut p = json!({
             "path1": remote,
@@ -113,15 +244,31 @@ fn bisync_in(
         if force {
             p["force"] = json!(true);
         }
-        rc_job(cfg, "sync/bisync", p).map(|_| ())
+        rc_job_full(cfg, "sync/bisync", p).map(|st| job_log(&st))
     };
     match run(false) {
+        Ok(log) => Ok(log),
+        // Through rc, rclone 1.60 leaves bisync's delete limit at 0% (the `maxDelete` parameter
+        // sets a different field), so any deletion aborts. The abort comes before anything is
+        // applied and the log has the counts, so apply bisync's usual limit here instead.
+        Err(f) if f.error.contains(TOO_MANY_DELETES) => {
+            let (gone1, gone2) = deleted_counts(&f.log);
+            let ok1 = deletes_ok(gone1, listing_count(workdir, local, Side::Remote));
+            let ok2 = deletes_ok(gone2, listing_count(workdir, local, Side::Local));
+            if ok1 && ok2 {
+                run(true).map_err(|f| f.error)
+            } else {
+                Err(format!(
+                    "bisync aborted: {TOO_MANY_DELETES} ({gone1} in the cloud, {gone2} here)"
+                ))
+            }
+        }
         // This check guards against every timestamp shifting at once (a FAT disk after a DST
         // change); here it mostly fires on small folders where the one file was edited. It
-        // aborts before anything is applied and only after the too-many-deletes check has
-        // passed, so repeating at once with `force` (which skips both) deletes nothing more.
-        Err(e) if e.contains(ALL_CHANGED) => run(true),
-        r => r,
+        // aborts before anything is applied and only after the delete check has passed, so
+        // repeating with `force` (which skips both) deletes nothing more.
+        Err(f) if f.error.contains(ALL_CHANGED) => run(true).map_err(|f| f.error),
+        Err(f) => Err(f.error),
     }
 }
 
@@ -376,8 +523,23 @@ impl Keeper {
     fn sync_once(&mut self, rel: &str, local: &Path, resync: bool) -> Result<(), String> {
         std::fs::create_dir_all(local).map_err(|e| e.to_string())?;
         let remote = self.remote_for(rel)?;
-        bisync(&self.cfg, &remote, local, resync)?;
+        let log = bisync(&self.cfg, &remote, local, resync)?;
+        self.record_deletions(rel, &log);
         self.resolve_conflicts(rel, &remote, local)
+    }
+
+    /// Note each deletion a sync applied, for the recent-activity list.
+    fn record_deletions(&mut self, rel: &str, log: &str) {
+        let at = now();
+        for (side, path) in applied_deletes(log) {
+            let deleted_in = match side {
+                // Removed from the cloud because it was deleted here, and the reverse.
+                Side::Remote => pin::DeletedIn::Here,
+                Side::Local => pin::DeletedIn::Cloud,
+            };
+            self.state
+                .record_deletion(at, format!("{rel}/{path}"), deleted_in);
+        }
     }
 
     fn failed(&mut self, rel: &str, err: &str, was_resync: bool) {
@@ -480,9 +642,12 @@ impl Keeper {
             let pushed = self
                 .remote_for(rel)
                 .and_then(|remote| bisync(&self.cfg, &remote, &local, false));
-            if let Err(e) = pushed {
-                self.pin(rel).error = Some(format!("Couldn't upload the last changes: {e}"));
-                return;
+            match pushed {
+                Ok(log) => self.record_deletions(rel, &log),
+                Err(e) => {
+                    self.pin(rel).error = Some(format!("Couldn't upload the last changes: {e}"));
+                    return;
+                }
             }
         }
         let unit = units::pin_unit_name(&pin::pin_id(rel));
@@ -666,6 +831,90 @@ mod tests {
         // And the next normal sync sees nothing to do.
         run(false).unwrap();
         assert_eq!(conflict::find_pairs(&l), Vec::<String>::new());
+
+        // A deletion here goes through despite rclone 1.60's 0% rc delete limit, and the log
+        // says what was deleted.
+        std::fs::write(r.join("sub/keep.txt"), "k").unwrap();
+        run(true).unwrap();
+        std::fs::remove_file(l.join("sub/a.txt")).unwrap();
+        let log = run(false).unwrap();
+        assert!(!r.join("sub/a.txt").exists());
+        assert_eq!(
+            applied_deletes(&log),
+            [(Side::Remote, "sub/a.txt".to_string())]
+        );
+    }
+
+    /// A real rclone 1.60 bisync log (paths shortened): one file deleted on each side, one new,
+    /// one newer.
+    const RUN_LOG: &str = "\
+2026/11/03 21:20:01 INFO  : Synching Path1 \"/p/r/\" with Path2 \"/p/l/\"
+2026/11/03 21:20:01 INFO  : Path1 checking for diffs
+2026/11/03 21:20:01 INFO  : - Path1    File was deleted                    - sub/a.txt
+2026/11/03 21:20:01 INFO  : - Path1    File is newer                       - sub/c.txt
+2026/11/03 21:20:01 INFO  : Path1:    2 changes:    0 new,    1 newer,    0 older,    1 deleted
+2026/11/03 21:20:01 INFO  : Path2 checking for diffs
+2026/11/03 21:20:01 INFO  : - Path2    File was deleted                    - sub/b.txt
+2026/11/03 21:20:01 INFO  : - Path2    File is new                         - sub/n.txt
+2026/11/03 21:20:01 INFO  : Path2:    2 changes:    1 new,    0 newer,    0 older,    1 deleted
+2026/11/03 21:20:01 INFO  : Applying changes
+2026/11/03 21:20:01 INFO  : - Path2    Queue delete                        - /p/l/sub/a.txt
+2026/11/03 21:20:01 INFO  : - Path1    Queue copy to Path2                 - /p/l/sub/c.txt
+2026/11/03 21:20:01 INFO  : - Path1    Queue delete                        - /p/r/sub/b.txt
+2026/11/03 21:20:01 INFO  : - Path2    Queue copy to Path1                 - /p/r/sub/n.txt
+2026/11/03 21:20:01 INFO  : - Path2    Do queued copies to                 - Path1
+2026/11/03 21:20:01 INFO  : sub/n.txt: Copied (new)
+2026/11/03 21:20:01 INFO  : - Path1    Do queued copies to                 - Path2
+2026/11/03 21:20:01 INFO  : sub/c.txt: Copied (replaced existing)
+2026/11/03 21:20:01 INFO  : -          Do queued deletes on                - Path1
+2026/11/03 21:20:01 INFO  : sub/b.txt: Deleted
+2026/11/03 21:20:01 INFO  : -          Do queued deletes on                - Path2
+2026/11/03 21:20:01 INFO  : sub/a.txt: Deleted
+2026/11/03 21:20:01 INFO  : Updating listings
+2026/11/03 21:20:01 INFO  : Bisync successful
+";
+
+    #[test]
+    fn reads_applied_deletions_from_the_log() {
+        assert_eq!(
+            applied_deletes(RUN_LOG),
+            [
+                (Side::Remote, "sub/b.txt".to_string()),
+                (Side::Local, "sub/a.txt".to_string())
+            ]
+        );
+        assert_eq!(applied_deletes(""), []);
+    }
+
+    #[test]
+    fn reads_deleted_counts_from_the_summaries() {
+        assert_eq!(deleted_counts(RUN_LOG), (1, 1));
+        assert_eq!(deleted_counts(""), (0, 0));
+    }
+
+    #[test]
+    fn delete_limit_is_half_the_folder_but_never_below_a_few_files() {
+        assert!(deletes_ok(3, Some(1068)), "the 3 GCS files in 1068");
+        assert!(deletes_ok(3, None), "a few files are always fine");
+        assert!(deletes_ok(500, Some(1000)));
+        assert!(!deletes_ok(501, Some(1000)));
+        assert!(!deletes_ok(10, None), "unknown size: be careful");
+    }
+
+    #[test]
+    fn counts_files_in_bisyncs_listing() {
+        let wd = std::env::temp_dir().join(format!("rcs-lst-{}", std::process::id()));
+        std::fs::create_dir_all(&wd).unwrap();
+        let local = Path::new("/home/u/.local/share/x/offline/abc");
+        let name = "gdrive{X}_Games..home_u_.local_share_x_offline_abc";
+        std::fs::write(
+            wd.join(format!("{name}.path2.lst")),
+            "# bisync listing v1 from 2026\n- 1 md5:x - 2026 \"a\"\n- 1 md5:y - 2026 \"b\"\n",
+        )
+        .unwrap();
+        assert_eq!(listing_count(&wd, local, Side::Local), Some(2));
+        assert_eq!(listing_count(&wd, local, Side::Remote), None);
+        std::fs::remove_dir_all(wd).ok();
     }
 
     #[test]
