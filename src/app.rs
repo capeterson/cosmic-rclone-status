@@ -2,7 +2,8 @@
 
 use crate::config::Config;
 use crate::mime_icon;
-use crate::rc::{self, human, CompletedTransfer, Direction, Health, Status};
+use crate::pin::{self, Change, OfflineState};
+use crate::rc::{self, human, ChangeKind, CompletedTransfer, Direction, Health, Status};
 use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
 use cosmic::iced::{time, window::Id, Alignment, Length, Limits, Subscription};
@@ -39,6 +40,8 @@ pub struct AppModel {
     shown: Vec<CompletedTransfer>,
     /// A `HistoryDebounced` message is already scheduled.
     history_pending: bool,
+    /// What the offline-folder keeper last reported.
+    offline: OfflineState,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +62,8 @@ pub enum Message {
     ShowMain,
     /// The debounce delay elapsed: show the newest history.
     HistoryDebounced,
+    OfflineLoaded(OfflineState),
+    OpenSettings,
 }
 
 impl AppModel {
@@ -68,13 +73,21 @@ impl AppModel {
         }
         self.fetching = true;
         let cfg = self.config.clone();
-        Task::perform(
+        let status = Task::perform(
             async move { tokio::task::spawn_blocking(move || rc::fetch(&cfg)).await },
             |res| match res {
                 Ok(st) => cosmic::Action::App(Message::StatusUpdated(st)),
                 Err(_) => cosmic::Action::App(Message::FetchFailed),
             },
-        )
+        );
+        if !self.config.offline_enabled {
+            return status;
+        }
+        let offline = Task::perform(
+            async { tokio::task::spawn_blocking(OfflineState::load).await },
+            |res| cosmic::Action::App(Message::OfflineLoaded(res.unwrap_or_default())),
+        );
+        Task::batch([status, offline])
     }
 
     /// Decide when the displayed history catches up with the latest status. The first fill is
@@ -177,6 +190,32 @@ fn detail_lines(st: &Status) -> Vec<String> {
     lines
 }
 
+/// "Offline: 2 folders · all available offline", or a nudge to finish setup.
+fn offline_line(pins: &[String], state: &OfflineState) -> String {
+    if state.updated == 0 {
+        "Offline folders: finish setup in Settings".to_string()
+    } else {
+        format!("Offline: {}", pin::summary(pins, state))
+    }
+}
+
+/// The active transfers: a caption and a full-width progress bar each, up to 8.
+fn transfer_rows(st: &Status) -> Element<'_, Message> {
+    let mut col = widget::Column::new().spacing(8).width(Length::Fill);
+    for t in st.transfers.iter().take(8) {
+        col = col
+            .push(widget::text::caption(transfer_line(t)))
+            .push(widget::determinate_linear(t.percentage as f32 / 100.0).width(Length::Fill));
+    }
+    if st.transfers.len() > 8 {
+        col = col.push(widget::text::caption(format!(
+            "…and {} more",
+            st.transfers.len() - 8
+        )));
+    }
+    col.into()
+}
+
 /// One line describing a transfer. `size` is negative when rclone doesn't know it.
 fn transfer_line(t: &rc::Transfer) -> String {
     let total = if t.size < 0 {
@@ -194,7 +233,7 @@ fn transfer_line(t: &rc::Transfer) -> String {
 }
 
 /// "just now", "5m ago", "3h ago", "2d ago". Empty when the time is unknown.
-fn ago(now: jiff::Timestamp, then: Option<jiff::Timestamp>) -> String {
+pub(crate) fn ago(now: jiff::Timestamp, then: Option<jiff::Timestamp>) -> String {
     let Some(then) = then else {
         return String::new();
     };
@@ -233,6 +272,57 @@ fn recent_caption(t: &CompletedTransfer, now: jiff::Timestamp) -> String {
     parts.join(" · ")
 }
 
+/// rclone's transfer history with offline-folder changes mixed in, newest first. rclone can't
+/// say what kind of change a transfer was, so offline folders' come from the keeper.
+fn with_changes(recent: Vec<CompletedTransfer>, changes: &[Change]) -> Vec<CompletedTransfer> {
+    if changes.is_empty() {
+        return recent;
+    }
+    let mut all = recent;
+    all.extend(changes.iter().map(|c| CompletedTransfer {
+        name: c.path.clone(),
+        size: c.size,
+        bytes: c.size.max(0),
+        at: jiff::Timestamp::from_second(c.at).ok(),
+        error: None,
+        direction: Some(c.direction),
+        times: 1,
+        kind: Some(c.kind),
+    }));
+    // Stable, so rclone's own order holds among equal times; unknown times go last.
+    all.sort_by_key(|t| std::cmp::Reverse(t.at));
+    all.truncate(rc::HISTORY_CAP);
+    all
+}
+
+/// The kind icon and its tooltip: new, changed or deleted.
+fn kind_icon(kind: ChangeKind) -> (&'static str, &'static str) {
+    match kind {
+        ChangeKind::Created => ("document-new-symbolic", "New file"),
+        ChangeKind::Updated => ("document-edit-symbolic", "Changed"),
+        ChangeKind::Deleted => ("user-trash-symbolic", "Deleted"),
+    }
+}
+
+/// The direction arrow's tooltip, worded for what happened to the file.
+fn direction_tip(direction: Direction, kind: Option<ChangeKind>) -> &'static str {
+    match (direction, kind) {
+        (Direction::Upload, Some(ChangeKind::Deleted)) => "Deleted here, so removed from the cloud",
+        (Direction::Download, Some(ChangeKind::Deleted)) => "Deleted in the cloud, so removed here",
+        (Direction::Upload, _) => "Uploaded to the cloud",
+        (Direction::Download, _) => "Downloaded from the cloud",
+    }
+}
+
+fn with_tip<'a>(icon: Element<'a, Message>, tip: &'static str) -> Element<'a, Message> {
+    widget::tooltip(
+        icon,
+        widget::text::body(tip),
+        widget::tooltip::Position::Top,
+    )
+    .into()
+}
+
 /// Why the history list is empty, in words.
 fn empty_history_text(st: &Status) -> &'static str {
     if !st.service_active || st.rc_error.is_some() {
@@ -269,22 +359,25 @@ fn recent_row(t: &CompletedTransfer, now: jiff::Timestamp, detailed: bool) -> El
         .align_y(Alignment::Center)
         .push(widget::icon(mime_icon::file_icon(&t.name, ICON_SIZE)).size(ICON_SIZE))
         .push(text);
-    match t.direction {
-        Some(Direction::Upload) => {
-            row = row.push(emblem(include_bytes!("../resources/emblems/uploading.svg")));
-        }
-        Some(Direction::Download) => {
-            row = row.push(emblem(include_bytes!(
-                "../resources/emblems/downloading.svg"
-            )));
-        }
-        None => {}
+    if let Some(kind) = t.kind {
+        let (icon, tip) = kind_icon(kind);
+        row = row.push(with_tip(widget::icon::from_name(icon).size(16).into(), tip));
+    }
+    if let Some(dir) = t.direction {
+        let svg: &'static [u8] = match dir {
+            Direction::Upload => include_bytes!("../resources/emblems/uploading.svg"),
+            Direction::Download => include_bytes!("../resources/emblems/downloading.svg"),
+        };
+        row = row.push(with_tip(emblem(svg), direction_tip(dir, t.kind)));
     }
     if t.error.is_some() {
         row = row.push(emblem(include_bytes!("../resources/emblems/error.svg")));
     }
     widget::button::custom(row)
-        .on_press(Message::OpenDetails(t.name.clone()))
+        // A deleted file has no details to show.
+        .on_press_maybe(
+            (t.kind != Some(ChangeKind::Deleted)).then(|| Message::OpenDetails(t.name.clone())),
+        )
         .class(cosmic::theme::Button::MenuItem)
         .width(Length::Fill)
         .padding([4, 8])
@@ -293,6 +386,21 @@ fn recent_row(t: &CompletedTransfer, now: jiff::Timestamp, detailed: bool) -> El
 
 impl AppModel {
     /// The default popup page: status, active transfers, recent files, actions.
+    /// One line on offline folders, when they're switched on.
+    fn offline_row(&self) -> Option<Element<'_, Message>> {
+        self.config.offline_enabled.then(|| {
+            widget::Row::new()
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .push(widget::icon::from_name("folder-download-symbolic").size(16))
+                .push(widget::text::caption(offline_line(
+                    &self.config.pins,
+                    &self.offline,
+                )))
+                .into()
+        })
+    }
+
     fn main_page(&self) -> Element<'_, Message> {
         let mut col = widget::Column::new()
             .spacing(8)
@@ -332,19 +440,15 @@ impl AppModel {
             col = col.push(title);
         }
 
+        if let Some(row) = self.offline_row() {
+            col = col.push(row);
+        }
+
         if let Some(st) = &self.status {
             if !st.transfers.is_empty() {
-                col = col.push(widget::divider::horizontal::default());
-                for t in st.transfers.iter().take(8) {
-                    col = col.push(widget::text::caption(transfer_line(t)));
-                    col = col.push(widget::determinate_linear(t.percentage as f32 / 100.0));
-                }
-                if st.transfers.len() > 8 {
-                    col = col.push(widget::text::caption(format!(
-                        "…and {} more",
-                        st.transfers.len() - 8
-                    )));
-                }
+                col = col
+                    .push(widget::divider::horizontal::default())
+                    .push(transfer_rows(st));
             }
             col = col.push(widget::divider::horizontal::default());
             let mut header = widget::Row::new()
@@ -384,7 +488,14 @@ impl AppModel {
             .push(
                 widget::button::destructive("Stop")
                     .on_press_maybe(running.then_some(Message::ServiceAction("stop"))),
-            );
+            )
+            .push(widget::Space::new().width(Length::Fill))
+            .push(widget::tooltip(
+                widget::button::icon(widget::icon::from_name("emblem-system-symbolic"))
+                    .on_press(Message::OpenSettings),
+                widget::text::body("Settings"),
+                widget::tooltip::Position::Top,
+            ));
         col.push(widget::divider::horizontal::default())
             .push(actions)
             .into()
@@ -492,7 +603,10 @@ impl cosmic::Application for AppModel {
     fn update(&mut self, message: Message) -> Task<cosmic::Action<Message>> {
         match message {
             Message::UpdateConfig(c) => self.config = c,
-            Message::StatusUpdated(st) => {
+            Message::StatusUpdated(mut st) => {
+                if self.config.offline_enabled {
+                    st.recent = with_changes(st.recent, &self.offline.changes);
+                }
                 self.status = Some(st);
                 self.fetching = false;
                 return self.sync_history();
@@ -511,6 +625,15 @@ impl cosmic::Application for AppModel {
             // request is what the flag prevents. The next tick picks up any change.
             Message::Tick | Message::ActionDone => return self.refresh(),
             Message::OpenFolder => rc::open_mount(&self.config),
+            Message::OfflineLoaded(s) => self.offline = s,
+            Message::OpenSettings => {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).arg("--settings").spawn();
+                }
+                if let Some(p) = self.popup.take() {
+                    return destroy_popup(p);
+                }
+            }
             Message::ServiceAction(verb) => {
                 let cfg = self.config.clone();
                 return Task::perform(
@@ -697,6 +820,7 @@ mod tests {
             error: None,
             direction: None,
             times: 1,
+            kind: None,
         }
     }
 
@@ -720,6 +844,50 @@ mod tests {
         assert_eq!(split_path("a/b/c.txt"), ("a/b", "c.txt"));
         assert_eq!(split_path("c.txt"), ("", "c.txt"));
         assert_eq!(split_path("a/b/"), ("a", "b"));
+    }
+
+    #[test]
+    fn offline_changes_are_merged_into_history_by_time() {
+        let recent = vec![
+            done("new.bin", 1, Some("2026-11-02T12:00:00Z")),
+            done("old.bin", 1, Some("2026-11-02T10:00:00Z")),
+        ];
+        let changes = [Change {
+            at: ts("2026-11-02T11:00:00Z").as_second(),
+            path: "Games/GCS/x.eqp".into(),
+            size: 7,
+            kind: ChangeKind::Updated,
+            direction: Direction::Upload,
+        }];
+        let merged = with_changes(recent.clone(), &changes);
+        let names: Vec<&str> = merged.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["new.bin", "Games/GCS/x.eqp", "old.bin"]);
+        assert_eq!(merged[1].kind, Some(ChangeKind::Updated));
+        assert_eq!(merged[1].direction, Some(Direction::Upload));
+        assert_eq!(merged[1].size, 7);
+        assert_eq!(with_changes(recent.clone(), &[]), recent);
+    }
+
+    #[test]
+    fn icons_explain_kind_and_direction() {
+        assert_eq!(kind_icon(ChangeKind::Created).1, "New file");
+        assert_eq!(kind_icon(ChangeKind::Deleted).0, "user-trash-symbolic");
+        assert_eq!(
+            direction_tip(Direction::Upload, None),
+            "Uploaded to the cloud"
+        );
+        assert_eq!(
+            direction_tip(Direction::Download, Some(ChangeKind::Created)),
+            "Downloaded from the cloud"
+        );
+        assert_eq!(
+            direction_tip(Direction::Upload, Some(ChangeKind::Deleted)),
+            "Deleted here, so removed from the cloud"
+        );
+        assert_eq!(
+            direction_tip(Direction::Download, Some(ChangeKind::Deleted)),
+            "Deleted in the cloud, so removed here"
+        );
     }
 
     #[test]

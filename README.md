@@ -28,11 +28,71 @@ Defaults (stored in cosmic-config under `com.ca-peterson.CosmicRcloneStatus`):
 | `service` | `rclone-gdrive.service` |
 | `mount_path` | `~/GoogleDrive` |
 | `cache_dir` | `~/.cache/rclone` (rclone's `--cache-dir`; read for per-file cache status) |
-| `context_menu` | `true` (add the "Rclone…" entry to COSMIC Files' right-click menu) |
+| `context_menu` | `true` (add the "rclone…" entry to COSMIC Files' right-click menu) |
+| `offline_enabled` | `false` (offline folders; switch on in Settings) |
+| `pins` | `[]` (folders kept offline, relative to the mount) |
+| `sync_interval_secs` | `300` (how often offline folders sync when nothing changes locally) |
 
-## Rclone details window
+The settings window (`--settings`, or the gear in the popup) covers offline folders and the
+right-click menu entry.
 
-Right-click a file or folder in COSMIC Files and choose **Rclone…** (the applet adds this entry
+## Offline folders
+
+Like Google Drive's "Available offline": a pinned folder is fully downloaded, kept in sync both
+ways, and works with no connection, right where it is in the Drive folder. Turn it on in
+Settings, then right-click a folder in COSMIC Files → **rclone…** → **Keep offline**.
+
+How it works:
+
+- The folder's local copy lives in `~/.local/share/cosmic-rclone-status/offline/<id>` and is
+  synced with `rclone bisync`, run *inside the mount's own rclone process* through its rc API
+  (`sync/bisync`), so there is no second rclone config or login. A background user service
+  (`cosmic-rclone-status-offline.service`) runs each sync: every `sync_interval_secs`, and about
+  10 seconds after a local change.
+- The local copy is mounted on top of the folder's place in the Drive folder
+  (`cosmic-rclone-status-pin@<id>.service`), so it shows up in place. Both services are bound to
+  the mount's service and start and stop with it; a folder that has been downloaded is mounted
+  even when offline.
+- Conflicts (the same file changed on both sides between syncs) are resolved as *newer wins*:
+  the older edit is uploaded first, so it stays in the file's version history in Google Drive
+  ("Manage versions"; Drive keeps old versions of uploaded files for about 30 days or 100
+  versions unless one is marked "Keep forever"). You get a notification.
+- Native Google Docs, Sheets and Slides are left out of the offline copy (rclone can only
+  download exports of them, which can't be synced back); they still open from the main mount.
+- If bisync stops for safety (too many deletions, or the folder vanished in the cloud), the
+  folder is marked **Needs attention**; **Repair** in Settings merges both sides without deleting
+  anything.
+- Unpinning uploads the last changes first (it waits if you're offline), then unmounts and deletes
+  the local copy.
+
+Turning the switch on first shows a dialog listing every change setup will make (only the ones
+not already done); **Continue** goes on to the password prompt, **Cancel** changes nothing and
+leaves the switch off. If setup can't finish (for example the password prompt is dismissed), it
+is undone and the switch goes back off. Before `/etc/fuse.conf` is edited it is copied to
+`/etc/fuse.conf.cosmic-rclone-status-<date-time>.bak`; if that copy fails the file is left alone.
+
+What setup does: mounting inside the Drive mount needs the Drive mount to use
+`--allow-other`, which ordinary users can only request once `user_allow_other` is set in
+`/etc/fuse.conf` (one line, added through the system password prompt). The app then adds a
+drop-in for the mount's service (`<service>.d/50-cosmic-rclone-status.conf`) that sets
+`--allow-other` together with `--default-permissions` and a `077` umask, so other users still
+can't open your files, and restarts the mount once. Turning offline folders off removes the
+services and the drop-in; the `/etc/fuse.conf` line is left in place.
+
+Each file a sync changes shows in the popup's recent activity with two small icons (hover for a
+tooltip): what happened (new, changed or deleted) and which way (an up arrow for this computer
+→ cloud, a down arrow for cloud → here). The keeper works this out by comparing the local copy
+with bisync's listings before and after each sync. A sync that would delete more than half of a
+folder's files (and more than 3) stops with **Needs attention** instead.
+
+See [Known limits](#known-limits) for what offline folders can't do.
+
+Command line: `--pin PATH`, `--unpin PATH`, `--pins`, `--offline-repair FOLDER`, and
+`--offline-remove` (used by `just uninstall-user`; refuses while folders are pinned).
+
+## rclone details window
+
+Right-click a file or folder in COSMIC Files and choose **rclone…** (the applet adds this entry
 to COSMIC Files' `context_actions` config when it starts; COSMIC Files cannot nest custom
 actions in a submenu, so it is one entry that opens this window). Clicking an item in the
 applet's recent-files list opens the same window. It shows:
@@ -76,6 +136,22 @@ jump on every poll. Newer rclone versions report each transfer's source and dest
 they do, rows get an upload or download arrow. Older versions (such as 1.60) show no arrow.
 File icons are chosen from the file name alone (shared-mime-info plus your icon theme); files
 are never read, so nothing is downloaded to draw the list.
+
+## Known limits
+
+- **New / changed / deleted icons only show for offline folders.** rclone's transfer history
+  doesn't say whether a file was new or changed, and keeps no record of deletions at all (they are
+  only logged at debug level). So for the rest of the Drive folder, rows have no kind icon, and
+  files deleted there (or on another device) don't appear.
+- **Direction arrows need a newer rclone outside offline folders.** rclone 1.60 doesn't report
+  where a transfer went; newer versions add `srcFs`/`dstFs`, and rows then get an arrow.
+- **Offline folders are folders only**, can't be nested inside each other, and very long folder
+  paths are refused (rclone 1.60's bisync names its working files after both full paths).
+- **Moving a file into or out of an offline folder** is a copy plus a delete, because it crosses
+  mounts.
+- **rclone 1.60 workarounds**: through the rc API, bisync's delete limit is stuck at 0% and its
+  "all files changed" check trips on small folders, so the keeper makes those checks itself (at
+  most half of a folder, or 3 files, deleted per sync) and then runs bisync with `force`.
 
 ## License
 

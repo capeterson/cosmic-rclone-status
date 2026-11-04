@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! The "Rclone…" window opened from COSMIC Files' right-click menu (`--menu PATH...`).
+//! The "rclone…" window opened from COSMIC Files' right-click menu (`--menu PATH...`).
 //! COSMIC Files can't nest custom actions in a submenu, so it has one entry that launches this
 //! window. It shows the item's sync status, who it is shared with, and the actions that apply.
 //!
@@ -9,9 +9,12 @@
 //! everything has arrived, then swaps to the finished layout in one step. That layout is fixed
 //! anyway: a non-resizable window, fixed-height sections and fixed column widths.
 
+use crate::config::expand;
 use crate::config::Config;
 use crate::drive::{self, DriveInfo, Kind, Permission};
+use crate::keeper;
 use crate::mime_icon;
+use crate::pin::{self, OfflineState, Phase};
 use crate::share::{self, Target};
 use crate::status::{self, human_bytes, Local, SyncState};
 use cosmic::app::Settings;
@@ -31,6 +34,9 @@ const STATUS_H: f32 = 152.0;
 const DETAIL_ROW_H: f32 = 24.0;
 const DETAIL_LABEL_W: f32 = 132.0;
 const PERM_ROW_H: f32 = 40.0;
+const OFFLINE_ROW_H: f32 = 40.0;
+/// How often the offline row re-reads the keeper's progress.
+const OFFLINE_REFRESH: Duration = Duration::from_secs(2);
 const ROLE_W: f32 = 96.0;
 const TYPE_W: f32 = 136.0;
 /// Keeps column headers aligned with rows that sit beside the scrollbar.
@@ -57,6 +63,41 @@ enum Message {
     OpenPath(String),
     /// Animation frame while loading.
     Tick(Instant),
+    /// Turn "Keep offline" on or off for this folder.
+    SetOffline(bool),
+    OfflineSet(Result<String, String>),
+    /// Time to re-read the keeper's progress.
+    OfflineTick,
+    OfflineRefreshed(Box<OfflineSnapshot>),
+}
+
+/// The offline-folder state as of one refresh. `cfg` is `None` if the refresh failed.
+#[derive(Debug, Clone, Default)]
+struct OfflineSnapshot {
+    cfg: Option<Config>,
+    state: OfflineState,
+    /// Files and bytes in the local copy of the folder at `path` (or the one it's inside).
+    usage: Option<(u64, u64)>,
+}
+
+/// Re-read the settings and the keeper's report, and measure the folder's local copy while it
+/// is downloading or synced (it's cheap: a walk of local metadata).
+fn offline_snapshot(path: &str) -> OfflineSnapshot {
+    let cfg = Config::load(crate::APP_ID);
+    let state = OfflineState::load();
+    let usage = share::remote_path(&expand(&cfg.mount_path), Path::new(path))
+        .and_then(|rel| pin::covering_pin(&cfg.pins, &rel).map(str::to_string))
+        .filter(|p| {
+            state
+                .pin(p)
+                .is_some_and(|s| matches!(s.phase, Phase::Downloading | Phase::Ready))
+        })
+        .map(|p| pin::local_usage(&p));
+    OfflineSnapshot {
+        cfg: Some(cfg),
+        state,
+        usage,
+    }
 }
 
 /// A value that is on its way, arrived, or failed.
@@ -92,6 +133,12 @@ struct Menu {
     drive: Load<DriveInfo>,
     /// "Open" has been clicked and shows its "Folder" / "File" choices.
     open_expanded: bool,
+    /// The offline-folder keeper's last report.
+    offline: OfflineState,
+    /// Why the last "Keep offline" change failed.
+    offline_error: Option<String>,
+    /// Files and bytes downloaded into the folder's local copy so far.
+    offline_usage: Option<(u64, u64)>,
     started: Instant,
     /// The time of the latest animation frame.
     now: Instant,
@@ -136,7 +183,7 @@ impl cosmic::Application for Menu {
     fn init(mut core: cosmic::Core, flags: Flags) -> (Self, Task) {
         core.window.show_maximize = false;
         core.window.show_minimize = false;
-        core.set_header_title("Rclone".into());
+        core.set_header_title("rclone".into());
         let first = flags.paths.first().cloned().unwrap_or_default();
         let name = Path::new(&first)
             .file_name()
@@ -152,6 +199,13 @@ impl cosmic::Application for Menu {
             local: Load::Pending,
             drive: Load::Pending,
             open_expanded: false,
+            offline: if flags.cfg.offline_enabled {
+                OfflineState::load()
+            } else {
+                OfflineState::default()
+            },
+            offline_error: None,
+            offline_usage: None,
             started: Instant::now(),
             now: Instant::now(),
         };
@@ -185,6 +239,38 @@ impl cosmic::Application for Menu {
             Message::Drive(r) => self.drive = Load::Done(r),
             Message::Tick(now) => self.now = now,
             Message::ToggleOpen => self.open_expanded = !self.open_expanded,
+            Message::SetOffline(on) => {
+                let path = self.path.clone();
+                return blocking(
+                    move || keeper::set_pinned(&path, on),
+                    Message::OfflineSet,
+                    Err,
+                );
+            }
+            Message::OfflineSet(r) => match r {
+                Ok(_) => {
+                    self.offline_error = None;
+                    self.cfg = Config::load(crate::APP_ID);
+                    return self.update(Message::OfflineTick);
+                }
+                Err(e) => self.offline_error = Some(e),
+            },
+            Message::OfflineTick => {
+                let path = self.path.clone();
+                return blocking(
+                    move || Box::new(offline_snapshot(&path)),
+                    Message::OfflineRefreshed,
+                    |_| Box::new(OfflineSnapshot::default()),
+                );
+            }
+            Message::OfflineRefreshed(snap) => {
+                if snap.cfg.is_some() {
+                    let OfflineSnapshot { cfg, state, usage } = *snap;
+                    self.cfg = cfg.unwrap_or_default();
+                    self.offline = state;
+                    self.offline_usage = usage;
+                }
+            }
             Message::OpenPath(p) => {
                 share::open_url(&p);
                 std::process::exit(0);
@@ -203,6 +289,9 @@ impl cosmic::Application for Menu {
     fn subscription(&self) -> Subscription<Message> {
         if self.loading() {
             time::every(FRAME).map(Message::Tick)
+        } else if self.cfg.offline_enabled {
+            // Follow the keeper as it downloads and syncs.
+            time::every(OFFLINE_REFRESH).map(|_| Message::OfflineTick)
         } else {
             Subscription::none()
         }
@@ -221,8 +310,12 @@ impl cosmic::Application for Menu {
             .push(widget::divider::horizontal::default())
             .push(self.sharing_header())
             .push(self.sharing_list())
-            .push(widget::divider::horizontal::default())
-            .push(self.actions());
+            .push(widget::divider::horizontal::default());
+        let body = match self.offline_row() {
+            Some(row) => body.push(row).push(widget::divider::horizontal::default()),
+            None => body,
+        };
+        let body = body.push(self.actions());
         widget::container(body)
             .padding(sp.space_s)
             .width(Length::Fill)
@@ -552,6 +645,57 @@ impl Menu {
         widget::scrollable(col).height(Length::Fill).into()
     }
 
+    // --- offline: only when offline folders are on ---
+
+    /// The "Keep offline" switch for a folder, or a note for things inside an offline folder.
+    fn offline_row(&self) -> Option<Element<'_, Message>> {
+        if !self.cfg.offline_enabled {
+            return None;
+        }
+        let rel = share::remote_path(&expand(&self.cfg.mount_path), Path::new(&self.path))?;
+        let covering = pin::covering_pin(&self.cfg.pins, &rel);
+        let (title, caption, toggle) = match covering {
+            Some(p) if p != rel => (
+                "Available offline".to_string(),
+                format!(
+                    "Part of the offline folder {p} · {}",
+                    pin::describe(self.offline.pin(p), None)
+                ),
+                None,
+            ),
+            _ if !self.is_dir => return None,
+            Some(p) => (
+                "Keep offline".to_string(),
+                pin::describe(self.offline.pin(p), self.offline_usage),
+                Some(true),
+            ),
+            None => (
+                "Keep offline".to_string(),
+                "Download this folder and keep it in sync both ways".to_string(),
+                Some(false),
+            ),
+        };
+        let caption = self.offline_error.clone().unwrap_or(caption);
+        let text = widget::column::with_capacity(2)
+            .width(Length::Fill)
+            .push(widget::text::body(title))
+            .push(widget::text::caption(caption).ellipsize(Ellipsize::End(lines())));
+        let mut row = widget::row::with_capacity(3)
+            .spacing(cosmic::theme::spacing().space_xs)
+            .align_y(Alignment::Center)
+            .push(widget::icon::from_name("folder-download-symbolic").size(16))
+            .push(text);
+        if let Some(on) = toggle {
+            row = row.push(widget::toggler(on).on_toggle(Message::SetOffline));
+        }
+        Some(
+            widget::container(row)
+                .height(Length::Fixed(OFFLINE_ROW_H))
+                .align_y(Alignment::Center)
+                .into(),
+        )
+    }
+
     // --- 4. actions: pinned last, present from the start ---
 
     fn actions(&self) -> Element<'_, Message> {
@@ -738,6 +882,9 @@ mod tests {
             local: Load::Pending,
             drive: Load::Pending,
             open_expanded: false,
+            offline: OfflineState::default(),
+            offline_error: None,
+            offline_usage: None,
             started: now,
             now,
         }

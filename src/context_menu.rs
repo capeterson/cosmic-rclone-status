@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Registers the single "Rclone…" entry in COSMIC Files' right-click menu.
+//! Registers the single "rclone…" entry in COSMIC Files' right-click menu.
 //!
 //! COSMIC Files has no extension API, only a `context_actions` list in its own config, rendered
 //! flat. We add one entry that runs `cosmic-rclone-status --menu %F` (see `menu.rs`); everything
@@ -37,20 +37,21 @@ pub struct Preset {
 /// The menu label. The dev copy gets its own so it doesn't replace the real applet's entry.
 pub fn entry_name() -> &'static str {
     if crate::APP_ID.ends_with("Dev") {
-        "Rclone (dev)…"
+        "rclone (dev)…"
     } else {
-        "Rclone…"
+        "rclone…"
     }
 }
 
-/// Is `name` one of ours, including the labels earlier prototypes used?
+/// Is `name` one of ours, including the labels earlier versions used (a capitalized
+/// "Rclone…", and the prototypes' "rclone: …" entries)?
 fn is_ours(name: &str) -> bool {
-    let legacy = if crate::APP_ID.ends_with("Dev") {
-        "rclone (dev): "
+    let (legacy, capitalized) = if crate::APP_ID.ends_with("Dev") {
+        ("rclone (dev): ", "Rclone (dev)…")
     } else {
-        "rclone: "
+        ("rclone: ", "Rclone…")
     };
-    name == entry_name() || name.starts_with(legacy)
+    name == entry_name() || name == capitalized || name.starts_with(legacy)
 }
 
 /// Quote the executable for an exec-style command line.
@@ -144,6 +145,20 @@ mod tests {
     }
 
     #[test]
+    fn the_old_capitalized_entry_is_replaced_not_duplicated() {
+        let old = if crate::APP_ID.ends_with("Dev") {
+            "Rclone (dev)…"
+        } else {
+            "Rclone…"
+        };
+        assert_eq!(
+            merge(vec![named(old)], vec![entry("/x")]),
+            vec![entry("/x")]
+        );
+        assert!(entry("/x").name.starts_with("rclone"));
+    }
+
+    #[test]
     fn merge_is_idempotent() {
         let once = merge(vec![], vec![entry("/x")]);
         assert_eq!(merge(once.clone(), vec![entry("/x")]), once);
@@ -190,7 +205,7 @@ mod tests {
         // spelling must be exactly these.
         let file = dir.join("cosmic").join(FILES_APP_ID).join("v1").join(KEY);
         let text = std::fs::read_to_string(file).unwrap();
-        for want in ["name:", "confirm:", "selection: Any", "steps:", "Rclone"] {
+        for want in ["name:", "confirm:", "selection: Any", "steps:", "rclone…"] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }
         std::fs::remove_dir_all(&dir).ok();

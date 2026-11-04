@@ -65,7 +65,7 @@ fn menu_install_adds_one_entry_that_runs_this_binary() {
     assert!(out.status.success(), "{}", stderr(&out));
     let text = sb.actions();
     assert_eq!(text.matches("name:").count(), 1, "{text}");
-    assert!(text.contains("Rclone…"), "{text}");
+    assert!(text.contains("rclone…"), "{text}");
     assert!(text.contains("--menu %F"), "{text}");
     assert!(text.contains("cosmic-rclone-status"), "{text}");
 }
@@ -87,7 +87,7 @@ fn menu_install_and_remove_leave_the_users_own_entries_alone() {
     sb.run(&["--menu-install"]);
     let text = sb.actions();
     assert!(
-        text.contains("Compress") && text.contains("Rclone…"),
+        text.contains("Compress") && text.contains("rclone…"),
         "{text}"
     );
 
@@ -95,7 +95,7 @@ fn menu_install_and_remove_leave_the_users_own_entries_alone() {
     assert!(out.status.success(), "{}", stderr(&out));
     let text = sb.actions();
     assert!(text.contains("Compress"), "{text}");
-    assert!(!text.contains("Rclone"), "{text}");
+    assert!(!text.contains("rclone…"), "{text}");
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn menu_install_replaces_prototype_entries() {
         !text.contains("rclone: Synced") && !text.contains("--ctl"),
         "{text}"
     );
-    assert!(text.contains("Rclone…"), "{text}");
+    assert!(text.contains("rclone…"), "{text}");
 }
 
 #[test]

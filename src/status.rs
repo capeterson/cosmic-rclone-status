@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Per-item sync status for the "Rclone…" window: what rclone knows locally (its transfer list
+//! Per-item sync status for the "rclone…" window: what rclone knows locally (its transfer list
 //! and VFS cache) combined with what Google Drive says (see `drive.rs`).
 //!
 //! rclone's VFS cache keeps one metadata file per cached item under

@@ -4,7 +4,7 @@
 
 use crate::config::{expand, Config};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::HashMap, process::Command, time::Duration};
 
 /// Treat JSON `null` like a missing field.
@@ -31,11 +31,20 @@ pub struct Transfer {
     pub speed: f64,
 }
 
-/// Which way a completed transfer went. Only known when rclone reports `srcFs`/`dstFs`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which way a completed transfer went. Known when rclone reports `srcFs`/`dstFs` (newer
+/// rclone), and for every change the offline-folder keeper records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     Upload,
     Download,
+}
+
+/// What happened to a file. Only known for offline folders: rclone's own history doesn't say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeKind {
+    Created,
+    Updated,
+    Deleted,
 }
 
 /// A finished transfer from `core/transferred`, with repeats of the same file merged.
@@ -53,6 +62,8 @@ pub struct CompletedTransfer {
     pub direction: Option<Direction>,
     /// How many raw entries were merged into this row (>= 1).
     pub times: u32,
+    /// Set for changes recorded by the offline-folder keeper (see `pin::Change`).
+    pub kind: Option<ChangeKind>,
 }
 
 /// Newest files kept in the history. rclone itself keeps about this many per stats group.
@@ -72,6 +83,9 @@ struct RawTransferred {
     completed_at: String,
     #[serde(deserialize_with = "null_as_default")]
     error: String,
+    /// The stats group: `job/N` for transfers made by an rc job.
+    #[serde(deserialize_with = "null_as_default")]
+    group: String,
     /// Newer rclone only.
     #[serde(rename = "srcFs")]
     src_fs: Option<String>,
@@ -117,6 +131,9 @@ fn history(raw: Vec<RawTransferred>, cap: usize) -> Vec<CompletedTransfer> {
         .into_iter()
         .enumerate()
         .filter(|(_, r)| !r.checked && !r.name.is_empty())
+        // rc jobs are the offline-folder keeper's syncs, which it records itself with more
+        // detail (and paths from the mount root, not the synced folder).
+        .filter(|(_, r)| !r.group.starts_with("job/"))
         .map(|(i, r)| {
             let at = parse_ts(&r.completed_at).or_else(|| parse_ts(&r.started_at));
             let error = Some(r.error.trim().to_string()).filter(|e| !e.is_empty());
@@ -128,6 +145,7 @@ fn history(raw: Vec<RawTransferred>, cap: usize) -> Vec<CompletedTransfer> {
                 at,
                 error,
                 times: 1,
+                kind: None,
             };
             (i, t)
         })
@@ -270,7 +288,7 @@ struct DiskCache {
     uploads_queued: u64,
 }
 
-fn service_active(service: &str) -> bool {
+pub fn service_active(service: &str) -> bool {
     Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", service])
         .status()
@@ -311,7 +329,7 @@ fn parse_mounts(mounts: &str, want: &str) -> bool {
     })
 }
 
-fn is_mounted(mount_path: &str) -> bool {
+pub fn is_mounted(mount_path: &str) -> bool {
     std::fs::read_to_string("/proc/mounts").is_ok_and(|m| parse_mounts(&m, &expand(mount_path)))
 }
 
@@ -374,10 +392,22 @@ fn rc_post<T: for<'de> Deserialize<'de>>(
     if let Some(a) = auth {
         req = req.set("Authorization", a);
     }
-    req.send_string(body)
-        .map_err(|e| e.to_string())?
-        .into_json()
-        .map_err(|e| e.to_string())
+    match req.send_string(body) {
+        Ok(resp) => resp.into_json().map_err(|e| e.to_string()),
+        // rclone puts the reason in the JSON body of an error reply; keep it.
+        Err(ureq::Error::Status(code, resp)) => {
+            let reason = resp
+                .into_json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v.get("error")?.as_str().map(str::to_string))
+                .filter(|e| !e.is_empty());
+            Err(match reason {
+                Some(r) => format!("status code {code}: {r}"),
+                None => format!("status code {code}"),
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Call an rc method with a JSON body and return the JSON reply.
@@ -408,6 +438,26 @@ fn parse_mount_fs(mounts: &str, want: &str) -> Option<String> {
         (fstype == "fuse.rclone" && unescape_mount(mp).trim_end_matches('/') == want)
             .then(|| unescape_mount(fs))
     })
+}
+
+/// The mount options (e.g. `rw,nosuid,user_id=1000,allow_other`) of the rclone mount at `want`.
+fn parse_mount_options(mounts: &str, want: &str) -> Option<String> {
+    let want = want.trim_end_matches('/');
+    mounts.lines().find_map(|l| {
+        let mut f = l.split_whitespace();
+        let (_, mp, fstype, opts) = (f.next()?, f.next()?, f.next()?, f.next()?);
+        (fstype == "fuse.rclone" && unescape_mount(mp).trim_end_matches('/') == want)
+            .then(|| opts.to_string())
+    })
+}
+
+/// Does the rclone mount at `mount_path` let other processes in (`--allow-other`)? Needed for
+/// offline folders, which are mounted inside it.
+pub fn mount_allows_other(mount_path: &str) -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .ok()
+        .and_then(|m| parse_mount_options(&m, &expand(mount_path)))
+        .is_some_and(|o| o.split(',').any(|x| x == "allow_other"))
 }
 
 /// Which rclone remote is mounted at `mount_path`.
@@ -518,7 +568,7 @@ fn item_path(mount_path: &str, name: &str) -> Option<String> {
     Some(format!("{mount}/{name}"))
 }
 
-/// Open the "Rclone…" details window for the remote path `name`, as a separate process (the
+/// Open the "rclone…" details window for the remote path `name`, as a separate process (the
 /// same window COSMIC Files' right-click entry opens). Nothing is downloaded.
 pub fn open_details(cfg: &Config, name: &str) {
     let (Some(path), Ok(exe)) = (item_path(&cfg.mount_path, name), std::env::current_exe()) else {
@@ -903,11 +953,24 @@ other: /home/u/Other fuse.sshfs rw 0 0
     }
 
     #[test]
+    fn offline_folder_jobs_are_left_to_the_keeper() {
+        // The mount's own transfers are in `global_stats`; `job/N` are the keeper's syncs,
+        // which it records itself (with kind, direction and full paths).
+        let r = raw(
+            r#"[{"name":"a","group":"global_stats","completed_at":"2026-11-02T10:00:00Z"},
+                {"name":"GCS/b","group":"job/445","completed_at":"2026-11-02T10:00:00Z"}]"#,
+        );
+        let h = history(r, 10);
+        let names: Vec<&str> = h.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["a"]);
+    }
+
+    #[test]
     fn transferred_parses_a_full_entry() {
         let r = raw(
             r#"[{"name":"Docs/a.txt","size":-1,"bytes":7,"checked":false,
                 "started_at":"2026-11-02T10:00:00-08:00","completed_at":"2026-11-02T10:00:01.123456789-08:00",
-                "error":"boom","group":"job/1","srcFs":"/home/u/.cache/rclone/vfs/gd","dstFs":"gd:"}]"#,
+                "error":"boom","group":"global_stats","srcFs":"/home/u/.cache/rclone/vfs/gd","dstFs":"gd:"}]"#,
         );
         let h = history(r, 10);
         assert_eq!(h.len(), 1);
@@ -1158,6 +1221,30 @@ work:sub/dir /home/u/My\\040Work fuse.rclone rw 0 0
             parse_mount_fs(FS_MOUNTS, "/home/u/My Work").as_deref(),
             Some("work:sub/dir")
         );
+    }
+
+    #[test]
+    fn mount_options_show_whether_other_processes_may_enter() {
+        let m = "gdrive: /home/u/D fuse.rclone rw,nosuid,user_id=1000,allow_other 0 0\n\
+                 x: /home/u/E fuse.rclone rw,nosuid,user_id=1000 0 0\n";
+        let allows =
+            |p| parse_mount_options(m, p).is_some_and(|o| o.split(',').any(|x| x == "allow_other"));
+        assert!(allows("/home/u/D"));
+        assert!(!allows("/home/u/E"));
+        assert_eq!(parse_mount_options(m, "/nope"), None);
+    }
+
+    #[test]
+    fn rc_errors_keep_rclones_reason() {
+        let (addr, h) = serve(vec![(
+            "500 Internal Server Error",
+            r#"{"error":"directory not found","status":500}"#.into(),
+        )]);
+        let agent = ureq::AgentBuilder::new().timeout(T).build();
+        let err =
+            rc_post::<serde_json::Value>(&agent, &addr, None, "sync/bisync", "{}").unwrap_err();
+        assert_eq!(err, "status code 500: directory not found");
+        h.join().unwrap();
     }
 
     #[test]

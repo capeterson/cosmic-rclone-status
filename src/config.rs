@@ -16,8 +16,14 @@ pub struct Config {
     pub mount_path: String,
     /// rclone's `--cache-dir` (`~` is expanded); read for per-file cache status.
     pub cache_dir: String,
-    /// Add an "Rclone…" entry to the COSMIC Files right-click menu.
+    /// Add an "rclone…" entry to the COSMIC Files right-click menu.
     pub context_menu: bool,
+    /// Offline folders are switched on (set up from the settings window).
+    pub offline_enabled: bool,
+    /// Folders kept available offline, relative to the mount root (no leading slash).
+    pub pins: Vec<String>,
+    /// How often each offline folder is synced with the remote when nothing changes locally.
+    pub sync_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -29,6 +35,9 @@ impl Default for Config {
             mount_path: "~/GoogleDrive".into(),
             cache_dir: "~/.cache/rclone".into(),
             context_menu: true,
+            offline_enabled: false,
+            pins: Vec::new(),
+            sync_interval_secs: 300,
         }
     }
 }
@@ -41,6 +50,18 @@ impl Config {
                 Ok(c) | Err((_, c)) => c,
             })
             .unwrap_or_default()
+    }
+
+    /// Change the saved settings: `f` edits a fresh copy, which is written back. Running apps
+    /// pick the change up through their config watch.
+    pub fn save(app_id: &str, f: impl FnOnce(&mut Config)) -> Result<Config, String> {
+        let ctx = cosmic_config::Config::new(app_id, Self::VERSION).map_err(|e| e.to_string())?;
+        let mut cfg = match Self::get_entry(&ctx) {
+            Ok(c) | Err((_, c)) => c,
+        };
+        f(&mut cfg);
+        cfg.write_entry(&ctx).map_err(|e| e.to_string())?;
+        Ok(cfg)
     }
 }
 
