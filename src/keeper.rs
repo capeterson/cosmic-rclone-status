@@ -301,6 +301,24 @@ fn classify_changes(
     out
 }
 
+/// What changed in `rel`'s local copy since its last sync: the files that will upload next.
+fn pending_local(rel: &str) -> Vec<String> {
+    let local = pin::local_dir(rel);
+    let Some(synced) =
+        listing_file(&pin::workdir(), &local, ".path2.lst").and_then(|f| listing_files(&f))
+    else {
+        return vec![];
+    };
+    let now = local_files(&local);
+    // Compared with itself, only the changes made here (the `synced` -> `now` step) remain.
+    classify_changes(&synced, &now, &now)
+        .into_iter()
+        .map(|(_, _, path, _)| path)
+        .filter(|p| !p.ends_with(".partial"))
+        .take(pin::PENDING_CAP)
+        .collect()
+}
+
 /// Run bisync for one folder.
 fn bisync(cfg: &Config, remote: &str, local: &Path, resync: bool) -> Result<(), String> {
     // Jobs run inside rclone, so one started by an earlier keeper (before a restart or an
@@ -616,6 +634,7 @@ impl Keeper {
             })
             .map(|p| p.rel.clone())
             .collect();
+        self.update_pending(&changed);
         let repair: HashSet<String> = std::fs::read_dir(repair_dir())
             .into_iter()
             .flatten()
@@ -638,6 +657,36 @@ impl Keeper {
             self.save();
         }
         if self.state.updated == 0 {
+            self.save();
+        }
+    }
+
+    /// Record which files in each local copy are waiting to upload, for the UI.
+    fn update_pending(&mut self, changed: &HashSet<String>) {
+        let lists: Vec<(String, Vec<String>)> = self
+            .state
+            .pins
+            .iter()
+            .filter(|p| p.initialized)
+            .map(|p| {
+                let list = if changed.contains(&p.rel) {
+                    pending_local(&p.rel)
+                } else {
+                    vec![]
+                };
+                (p.rel.clone(), list)
+            })
+            .collect();
+        let mut dirty = false;
+        for (rel, list) in lists {
+            if let Some(p) = self.state.pin_mut(&rel) {
+                if p.pending != list {
+                    p.pending = list;
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
             self.save();
         }
     }
@@ -680,6 +729,7 @@ impl Keeper {
                 p.initialized = true;
                 p.phase = Phase::Ready;
                 p.last_sync = Some(now());
+                p.pending.clear();
                 p.failures = 0;
                 p.error = None;
                 if first {

@@ -165,18 +165,74 @@ fn read_meta(path: &Path) -> Option<Cached> {
     parse_meta(&std::fs::read_to_string(path).ok()?)
 }
 
-/// Names of the files rclone is transferring right now.
-fn transferring_names(cfg: &Config) -> Result<Vec<String>, String> {
+/// The files rclone is transferring right now.
+fn transfers(cfg: &Config) -> Result<Vec<rc::Transfer>, String> {
     let stats = rc::rc_request(cfg, "core/stats", &json!({}))?;
     Ok(stats
         .get("transferring")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
-                .filter_map(|t| t.get("name")?.as_str().map(str::to_string))
+                .filter_map(|t| serde_json::from_value(t.clone()).ok())
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// What the offline-folder keeper is doing inside the item being looked at.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OfflineActivity {
+    /// Files its sync is sending to the cloud right now.
+    pub uploading: Vec<String>,
+    /// Files its sync is bringing down right now.
+    pub downloading: Vec<String>,
+    /// Changed here, waiting for the next sync.
+    pub queued: Vec<String>,
+}
+
+/// An offline folder is kept in step by a bisync job inside the mount's rclone, so its transfers
+/// show in `core/stats` with paths relative to the folder (never in the VFS cache), and its
+/// waiting changes are what the keeper reports. Returns what concerns `target`, or `None` if
+/// it isn't inside an offline folder.
+fn offline_activity(
+    cfg: &Config,
+    target: &Target,
+    running: &[rc::Transfer],
+    state: &crate::pin::OfflineState,
+) -> Option<OfflineActivity> {
+    if !cfg.offline_enabled {
+        return None;
+    }
+    let pin_rel = crate::pin::covering_pin(&cfg.pins, &target.rel)?;
+    let inside = target
+        .rel
+        .strip_prefix(pin_rel)
+        .unwrap_or_default()
+        .trim_matches('/');
+    let within =
+        |name: &str| inside.is_empty() || name == inside || name.starts_with(&format!("{inside}/"));
+    let local = crate::pin::local_dir(pin_rel)
+        .to_string_lossy()
+        .into_owned();
+    let is_local = |fs: &Option<String>| fs.as_deref().is_some_and(|f| f.contains(&local));
+    let mut a = OfflineActivity::default();
+    for t in running.iter().filter(|t| within(&t.name)) {
+        // Bring-down writes into the local copy; sending reads from it.
+        if is_local(&t.dst_fs) {
+            a.downloading.push(t.name.clone());
+        } else if is_local(&t.src_fs) {
+            a.uploading.push(t.name.clone());
+        }
+    }
+    if let Some(p) = state.pin(pin_rel) {
+        a.queued = p
+            .pending
+            .iter()
+            .filter(|n| within(n) && !a.uploading.contains(n))
+            .cloned()
+            .collect();
+    }
+    Some(a)
 }
 
 /// Walk `dir` (a `vfsMeta` folder), calling `f` with each file's parsed metadata and its path
@@ -213,10 +269,15 @@ fn walk(dir: &Path, rel: &str, seen: &mut usize, f: &mut impl FnMut(&str, Cached
 /// Gather the local half of the status for `target`.
 pub fn local(cfg: &Config, target: &Target) -> Result<Local, String> {
     let root = meta_root(cfg, &target.fs);
-    let busy = transferring_names(cfg)?;
+    let running = transfers(cfg)?;
+    let busy: Vec<String> = running.iter().map(|t| t.name.clone()).collect();
+    let offline = offline_activity(cfg, target, &running, &crate::pin::OfflineState::load());
     if !target.is_dir {
         let cached = read_meta(&root.join(&target.rel));
-        let transferring = busy.contains(&target.rel);
+        let transferring = busy.contains(&target.rel)
+            || offline
+                .as_ref()
+                .is_some_and(|a| !a.uploading.is_empty() || !a.downloading.is_empty());
         return Ok(Local::File {
             transferring,
             cached,
@@ -251,6 +312,11 @@ pub fn local(cfg: &Config, target: &Target) -> Result<Local, String> {
         .iter()
         .filter(|p| !busy.iter().any(|n| n == *p))
         .count();
+    if let Some(a) = offline {
+        sum.uploading += a.uploading.len();
+        sum.downloading += a.downloading.len();
+        sum.waiting_to_upload += a.queued.len();
+    }
     Ok(Local::Folder(sum))
 }
 
@@ -315,6 +381,120 @@ pub fn fmt_time(ts: Timestamp) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::pin::{OfflineState, PinState};
+
+    fn offline_cfg() -> Config {
+        Config {
+            offline_enabled: true,
+            pins: vec!["Docs".into()],
+            ..Config::default()
+        }
+    }
+
+    fn target_at(rel: &str, is_dir: bool) -> Target {
+        Target {
+            provider: crate::share::Provider::GoogleDrive,
+            id: "i".into(),
+            is_dir,
+            fs: "gdrive:".into(),
+            rel: rel.into(),
+        }
+    }
+
+    fn state(pending: &[&str]) -> OfflineState {
+        OfflineState {
+            pins: vec![PinState {
+                rel: "Docs".into(),
+                pending: pending.iter().map(ToString::to_string).collect(),
+                ..PinState::default()
+            }],
+            ..OfflineState::default()
+        }
+    }
+
+    fn running() -> Vec<rc::Transfer> {
+        let local = crate::pin::local_dir("Docs").to_string_lossy().into_owned();
+        let t = |name: &str, src: &str, dst: &str| rc::Transfer {
+            name: name.into(),
+            src_fs: Some(src.into()),
+            dst_fs: Some(dst.into()),
+            ..rc::Transfer::default()
+        };
+        vec![
+            // The keeper's sync: down into the local copy, up out of it.
+            t("a/down.bin", "gdrive:Docs", &local),
+            t("up.bin", &local, "gdrive:Docs"),
+            // Something else the mount is doing.
+            t(
+                "Elsewhere/x.bin",
+                "gdrive:",
+                "/home/u/.cache/rclone/vfs/gdrive",
+            ),
+        ]
+    }
+
+    #[test]
+    fn offline_transfers_and_queue_are_counted_for_the_folder() {
+        let a = offline_activity(
+            &offline_cfg(),
+            &target_at("Docs", true),
+            &running(),
+            &state(&["up.bin", "queued.txt", "a/also.txt"]),
+        )
+        .unwrap();
+        assert_eq!(a.downloading, ["a/down.bin"]);
+        assert_eq!(a.uploading, ["up.bin"]);
+        // `up.bin` is already uploading, so it isn't also queued.
+        assert_eq!(a.queued, ["queued.txt", "a/also.txt"]);
+    }
+
+    #[test]
+    fn a_subfolder_or_file_only_sees_its_own_part() {
+        let cfg = offline_cfg();
+        let sub = offline_activity(
+            &cfg,
+            &target_at("Docs/a", true),
+            &running(),
+            &state(&["up.bin", "queued.txt", "a/also.txt"]),
+        )
+        .unwrap();
+        assert_eq!(sub.downloading, ["a/down.bin"]);
+        assert_eq!(sub.uploading, Vec::<String>::new());
+        assert_eq!(sub.queued, ["a/also.txt"]);
+        // A name that merely starts the same isn't inside the folder.
+        let other = offline_activity(
+            &cfg,
+            &target_at("Docs/ab", true),
+            &running(),
+            &state(&["a/also.txt"]),
+        )
+        .unwrap();
+        assert_eq!(other, OfflineActivity::default());
+        let file = offline_activity(
+            &cfg,
+            &target_at("Docs/up.bin", false),
+            &running(),
+            &state(&[]),
+        )
+        .unwrap();
+        assert_eq!(file.uploading, ["up.bin"]);
+    }
+
+    #[test]
+    fn items_outside_offline_folders_have_no_offline_activity() {
+        let cfg = offline_cfg();
+        assert!(
+            offline_activity(&cfg, &target_at("Other", true), &running(), &state(&[])).is_none()
+        );
+        let off = Config {
+            offline_enabled: false,
+            ..cfg
+        };
+        assert!(
+            offline_activity(&off, &target_at("Docs", true), &running(), &state(&[])).is_none()
+        );
+    }
+
     use super::*;
 
     fn ts(s: &str) -> Timestamp {

@@ -35,7 +35,7 @@ const DETAIL_ROW_H: f32 = 24.0;
 const DETAIL_LABEL_W: f32 = 132.0;
 const PERM_ROW_H: f32 = 40.0;
 const OFFLINE_ROW_H: f32 = 40.0;
-/// How often the offline row re-reads the keeper's progress.
+/// How often the window re-reads the transfer counts and the keeper's progress.
 const OFFLINE_REFRESH: Duration = Duration::from_secs(2);
 const ROLE_W: f32 = 96.0;
 const TYPE_W: f32 = 136.0;
@@ -139,6 +139,8 @@ struct Menu {
     offline_error: Option<String>,
     /// Files and bytes downloaded into the folder's local copy so far.
     offline_usage: Option<(u64, u64)>,
+    /// A refresh of `local` is in flight (so ticks don't stack them up).
+    local_busy: bool,
     started: Instant,
     /// The time of the latest animation frame.
     now: Instant,
@@ -206,6 +208,7 @@ impl cosmic::Application for Menu {
             },
             offline_error: None,
             offline_usage: None,
+            local_busy: false,
             started: Instant::now(),
             now: Instant::now(),
         };
@@ -221,6 +224,7 @@ impl cosmic::Application for Menu {
                     Ok(t) => {
                         let (cfg, cfg2) = (self.cfg.clone(), self.cfg.clone());
                         let (t1, t2) = (t.clone(), t.clone());
+                        self.local_busy = true;
                         Task::batch([
                             blocking(move || status::local(&cfg, &t1), Message::Local, Err),
                             blocking(move || drive::fetch(&cfg2, &t2), Message::Drive, Err),
@@ -235,7 +239,13 @@ impl cosmic::Application for Menu {
                 self.target = Load::Done(r);
                 return task;
             }
-            Message::Local(r) => self.local = Load::Done(r),
+            Message::Local(r) => {
+                self.local_busy = false;
+                // A refresh that fails keeps showing the last good answer.
+                if r.is_ok() || self.local.ok().is_none() {
+                    self.local = Load::Done(r);
+                }
+            }
             Message::Drive(r) => self.drive = Load::Done(r),
             Message::Tick(now) => self.now = now,
             Message::ToggleOpen => self.open_expanded = !self.open_expanded,
@@ -256,12 +266,28 @@ impl cosmic::Application for Menu {
                 Err(e) => self.offline_error = Some(e),
             },
             Message::OfflineTick => {
-                let path = self.path.clone();
-                return blocking(
-                    move || Box::new(offline_snapshot(&path)),
-                    Message::OfflineRefreshed,
-                    |_| Box::new(OfflineSnapshot::default()),
-                );
+                let mut tasks = vec![];
+                if self.cfg.offline_enabled {
+                    let path = self.path.clone();
+                    tasks.push(blocking(
+                        move || Box::new(offline_snapshot(&path)),
+                        Message::OfflineRefreshed,
+                        |_| Box::new(OfflineSnapshot::default()),
+                    ));
+                }
+                // Transfers and queues change while the window is open; keep the counts live.
+                if !self.local_busy {
+                    if let Some(t) = self.target.ok().cloned() {
+                        self.local_busy = true;
+                        let cfg = self.cfg.clone();
+                        tasks.push(blocking(
+                            move || status::local(&cfg, &t),
+                            Message::Local,
+                            Err,
+                        ));
+                    }
+                }
+                return Task::batch(tasks);
             }
             Message::OfflineRefreshed(snap) => {
                 if snap.cfg.is_some() {
@@ -289,11 +315,9 @@ impl cosmic::Application for Menu {
     fn subscription(&self) -> Subscription<Message> {
         if self.loading() {
             time::every(FRAME).map(Message::Tick)
-        } else if self.cfg.offline_enabled {
-            // Follow the keeper as it downloads and syncs.
-            time::every(OFFLINE_REFRESH).map(|_| Message::OfflineTick)
         } else {
-            Subscription::none()
+            // Follow transfers, the queue and the offline keeper while the window is open.
+            time::every(OFFLINE_REFRESH).map(|_| Message::OfflineTick)
         }
     }
 
@@ -483,6 +507,23 @@ impl Menu {
                 "Waiting to sync offline copy".into(),
                 String::new(),
             )),
+            // A file inside an idle offline folder: not in the mount's cache, but here.
+            (Phase::Ready, false) if !self.is_dir => {
+                let inside = rel.strip_prefix(p.rel.as_str()).unwrap_or_default();
+                Some(if p.pending.iter().any(|n| n == inside.trim_matches('/')) {
+                    (
+                        SyncState::QueuedUpload.icon(),
+                        SyncState::QueuedUpload.label().into(),
+                        String::new(),
+                    )
+                } else {
+                    (
+                        SyncState::InSync.icon(),
+                        "Available offline".into(),
+                        String::new(),
+                    )
+                })
+            }
             (Phase::Ready, false) => None,
         }
     }
@@ -946,6 +987,7 @@ mod tests {
             offline: OfflineState::default(),
             offline_error: None,
             offline_usage: None,
+            local_busy: false,
             started: now,
             now,
         }
@@ -1227,6 +1269,36 @@ mod tests {
         // A folder inside it isn't the pin itself, so it keeps the usual cache row.
         m.path = "/m/d/sub".into();
         assert_eq!(m.detail_rows()[3].0, "Cached");
+    }
+
+    #[test]
+    fn a_file_in_an_idle_offline_folder_is_available_offline() {
+        let mut m = in_offline_folder(Phase::Ready, false);
+        m.is_dir = false;
+        m.path = "/m/d/sub/a.txt".into();
+        assert_eq!(m.status_line().1, "Available offline");
+        // ...unless it has a change waiting to upload.
+        m.offline.pins[0].pending = vec!["sub/a.txt".into()];
+        assert_eq!(m.status_line().1, "Queued for upload");
+        m.offline.pins[0].pending = vec!["sub/other.txt".into()];
+        assert_eq!(m.status_line().1, "Available offline");
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_last_good_counts() {
+        let mut m = in_offline_folder(Phase::Ready, false);
+        let good = Local::Folder(FolderSummary {
+            uploading: 2,
+            ..FolderSummary::default()
+        });
+        let _ = m.update(Message::Local(Ok(good.clone())));
+        assert!(!m.local_busy);
+        let _ = m.update(Message::Local(Err("rc down".into())));
+        assert_eq!(m.local.ok(), Some(&good));
+        // But a first failure is shown.
+        m.local = Load::Pending;
+        let _ = m.update(Message::Local(Err("rc down".into())));
+        assert_eq!(m.local.err(), Some("rc down"));
     }
 
     #[test]
