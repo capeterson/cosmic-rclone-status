@@ -398,6 +398,11 @@ impl Menu {
         if let Some(e) = self.local.err() {
             return ("dialog-error-symbolic", "Error".into(), e.to_string());
         }
+        // An offline folder is downloaded and synced by the keeper (a bisync job that writes
+        // straight into the local copy), which the mount's own transfer counts below never see.
+        if let Some(status) = self.offline_status() {
+            return status;
+        }
         let checking = (LOADING, "Checking…".to_string(), String::new());
         let Some(local) = self.local.ok() else {
             return checking;
@@ -441,6 +446,58 @@ impl Menu {
         }
     }
 
+    /// The status line for an item inside an offline folder whose keeper is busy (or stuck).
+    fn offline_status(&self) -> Option<(&'static str, String, String)> {
+        if !self.cfg.offline_enabled {
+            return None;
+        }
+        let rel = share::remote_path(&expand(&self.cfg.mount_path), Path::new(&self.path))?;
+        let p = self.offline.pin(pin::covering_pin(&self.cfg.pins, &rel)?)?;
+        let so_far = || match self.offline_usage {
+            Some((n, b)) if n > 0 => format!("{n} file(s), {} so far", human_bytes(b)),
+            _ => String::new(),
+        };
+        match (p.phase, p.syncing) {
+            (Phase::Downloading, _) => Some((
+                SyncState::Downloading.icon(),
+                "Downloading for offline use".into(),
+                so_far(),
+            )),
+            (Phase::Removing, _) => Some((
+                "content-loading-symbolic",
+                "Removing offline copy".into(),
+                String::new(),
+            )),
+            (Phase::Attention, _) => Some((
+                "dialog-warning-symbolic",
+                "Offline sync needs attention".into(),
+                String::new(),
+            )),
+            (Phase::Ready | Phase::Waiting, true) => Some((
+                SyncState::LocalNewer.icon(),
+                "Syncing offline copy".into(),
+                String::new(),
+            )),
+            (Phase::Waiting, false) => Some((
+                "content-loading-symbolic",
+                "Waiting to sync offline copy".into(),
+                String::new(),
+            )),
+            (Phase::Ready, false) => None,
+        }
+    }
+
+    /// "362 file(s), 563.1 MiB" for a folder that is itself kept offline.
+    fn offline_copy(&self) -> Option<String> {
+        if !self.cfg.offline_enabled {
+            return None;
+        }
+        let rel = share::remote_path(&expand(&self.cfg.mount_path), Path::new(&self.path))?;
+        (pin::covering_pin(&self.cfg.pins, &rel)? == rel).then_some(())?;
+        let (n, b) = self.offline_usage?;
+        Some(format!("{n} file(s), {}", human_bytes(b)))
+    }
+
     /// The four label/value pairs under the status line, with placeholders while loading.
     fn detail_rows(&self) -> [(&'static str, String); 4] {
         let wait = |l: &Load<_>| l.ok().is_none() && l.err().is_none();
@@ -459,17 +516,21 @@ impl Menu {
                 ("Uploading", from_local(&|s| s.uploading.to_string())),
                 ("Queued", from_local(&|s| s.waiting_to_upload.to_string())),
                 ("Downloading", from_local(&|s| s.downloading.to_string())),
-                (
-                    "Cached",
-                    from_local(&|s| {
-                        format!(
-                            "{}{} file(s), {}",
-                            s.cached_files,
-                            if s.truncated { "+" } else { "" },
-                            human_bytes(s.cached_bytes)
-                        )
-                    }),
-                ),
+                // An offline folder's files live in its local copy, not in the mount's cache.
+                match self.offline_copy() {
+                    Some(copy) => ("Offline copy", copy),
+                    None => (
+                        "Cached",
+                        from_local(&|s| {
+                            format!(
+                                "{}{} file(s), {}",
+                                s.cached_files,
+                                if s.truncated { "+" } else { "" },
+                                human_bytes(s.cached_bytes)
+                            )
+                        }),
+                    ),
+                },
             ];
         }
         let cached = match self.local.ok() {
@@ -1123,6 +1184,76 @@ mod tests {
             (icon, label.as_str()),
             ("emblem-ok-symbolic", "Nothing pending")
         );
+    }
+
+    /// A menu for an item inside the offline folder `d`, whose keeper is in `phase`.
+    fn in_offline_folder(phase: Phase, syncing: bool) -> Menu {
+        let mut m = menu(true);
+        m.cfg.mount_path = "/m".into();
+        m.cfg.offline_enabled = true;
+        m.cfg.pins = vec!["d".into()];
+        m.path = "/m/d".into();
+        m.target = Load::Done(Ok(target(true)));
+        m.local = Load::Done(Ok(Local::Folder(FolderSummary::default())));
+        m.offline.pins.push(pin::PinState {
+            rel: "d".into(),
+            phase,
+            syncing,
+            ..pin::PinState::default()
+        });
+        m
+    }
+
+    #[test]
+    fn the_initial_offline_download_is_not_nothing_pending() {
+        let mut m = in_offline_folder(Phase::Downloading, true);
+        m.offline_usage = Some((12, 3 * 1024 * 1024));
+        let (icon, label, detail) = m.status_line();
+        assert_eq!(icon, SyncState::Downloading.icon());
+        assert_eq!(label, "Downloading for offline use");
+        assert_eq!(detail, "12 file(s), 3.0 MiB so far");
+        // Even before the first file has landed.
+        m.offline_usage = None;
+        assert_eq!(m.status_line().2, "");
+    }
+
+    #[test]
+    fn an_offline_folder_shows_its_copy_instead_of_an_empty_cache() {
+        let mut m = in_offline_folder(Phase::Ready, false);
+        m.offline_usage = Some((362, 563 * 1024 * 1024));
+        let rows = m.detail_rows();
+        assert_eq!(rows[3].0, "Offline copy");
+        assert!(rows[3].1.starts_with("362 file(s), 563"), "{}", rows[3].1);
+        // A folder inside it isn't the pin itself, so it keeps the usual cache row.
+        m.path = "/m/d/sub".into();
+        assert_eq!(m.detail_rows()[3].0, "Cached");
+    }
+
+    #[test]
+    fn offline_syncs_and_problems_show_in_the_status_line() {
+        let label = |phase, syncing| in_offline_folder(phase, syncing).status_line().1;
+        assert_eq!(label(Phase::Ready, true), "Syncing offline copy");
+        assert_eq!(label(Phase::Waiting, true), "Syncing offline copy");
+        assert_eq!(label(Phase::Waiting, false), "Waiting to sync offline copy");
+        assert_eq!(
+            label(Phase::Attention, false),
+            "Offline sync needs attention"
+        );
+        assert_eq!(label(Phase::Removing, false), "Removing offline copy");
+        // A quiet, synced offline folder falls through to the usual status.
+        assert_eq!(label(Phase::Ready, false), "Nothing pending");
+    }
+
+    #[test]
+    fn items_inside_the_offline_folder_follow_its_state_and_others_do_not() {
+        let mut m = in_offline_folder(Phase::Downloading, true);
+        m.path = "/m/d/sub/a.txt".into();
+        assert_eq!(m.status_line().1, "Downloading for offline use");
+        m.path = "/m/other".into();
+        assert_eq!(m.status_line().1, "Nothing pending");
+        m.path = "/m/d".into();
+        m.cfg.offline_enabled = false;
+        assert_eq!(m.status_line().1, "Nothing pending");
     }
 
     #[test]
