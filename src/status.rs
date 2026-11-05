@@ -98,7 +98,6 @@ impl Cached {
 pub struct FolderSummary {
     pub uploading: usize,
     pub downloading: usize,
-    pub waiting_to_upload: usize,
     pub cached_files: usize,
     pub cached_bytes: u64,
     /// The scan stopped at [`FOLDER_SCAN_CAP`], so the cache counts are lower bounds.
@@ -186,19 +185,15 @@ pub struct OfflineActivity {
     pub uploading: Vec<String>,
     /// Files its sync is bringing down right now.
     pub downloading: Vec<String>,
-    /// Changed here, waiting for the next sync.
-    pub queued: Vec<String>,
 }
 
 /// An offline folder is kept in step by a bisync job inside the mount's rclone, so its transfers
-/// show in `core/stats` with paths relative to the folder (never in the VFS cache), and its
-/// waiting changes are what the keeper reports. Returns what concerns `target`, or `None` if
-/// it isn't inside an offline folder.
+/// show in `core/stats` with paths relative to the folder (never in the VFS cache). Returns what
+/// concerns `target`, or `None` if it isn't inside an offline folder.
 fn offline_activity(
     cfg: &Config,
     target: &Target,
     running: &[rc::Transfer],
-    state: &crate::pin::OfflineState,
 ) -> Option<OfflineActivity> {
     if !cfg.offline_enabled {
         return None;
@@ -223,14 +218,6 @@ fn offline_activity(
         } else if is_local(&t.src_fs) {
             a.uploading.push(t.name.clone());
         }
-    }
-    if let Some(p) = state.pin(pin_rel) {
-        a.queued = p
-            .pending
-            .iter()
-            .filter(|n| within(n) && !a.uploading.contains(n))
-            .cloned()
-            .collect();
     }
     Some(a)
 }
@@ -271,7 +258,7 @@ pub fn local(cfg: &Config, target: &Target) -> Result<Local, String> {
     let root = meta_root(cfg, &target.fs);
     let running = transfers(cfg)?;
     let busy: Vec<String> = running.iter().map(|t| t.name.clone()).collect();
-    let offline = offline_activity(cfg, target, &running, &crate::pin::OfflineState::load());
+    let offline = offline_activity(cfg, target, &running);
     if !target.is_dir {
         let cached = read_meta(&root.join(&target.rel));
         let transferring = busy.contains(&target.rel)
@@ -308,14 +295,9 @@ pub fn local(cfg: &Config, target: &Target) -> Result<Local, String> {
             sum.downloading += 1;
         }
     }
-    sum.waiting_to_upload = dirty_paths
-        .iter()
-        .filter(|p| !busy.iter().any(|n| n == *p))
-        .count();
     if let Some(a) = offline {
         sum.uploading += a.uploading.len();
         sum.downloading += a.downloading.len();
-        sum.waiting_to_upload += a.queued.len();
     }
     Ok(Local::Folder(sum))
 }
@@ -381,8 +363,6 @@ pub fn fmt_time(ts: Timestamp) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::pin::{OfflineState, PinState};
-
     fn offline_cfg() -> Config {
         Config {
             offline_enabled: true,
@@ -398,17 +378,6 @@ mod tests {
             is_dir,
             fs: "gdrive:".into(),
             rel: rel.into(),
-        }
-    }
-
-    fn state(pending: &[&str]) -> OfflineState {
-        OfflineState {
-            pins: vec![PinState {
-                rel: "Docs".into(),
-                pending: pending.iter().map(ToString::to_string).collect(),
-                ..PinState::default()
-            }],
-            ..OfflineState::default()
         }
     }
 
@@ -434,65 +403,34 @@ mod tests {
     }
 
     #[test]
-    fn offline_transfers_and_queue_are_counted_for_the_folder() {
-        let a = offline_activity(
-            &offline_cfg(),
-            &target_at("Docs", true),
-            &running(),
-            &state(&["up.bin", "queued.txt", "a/also.txt"]),
-        )
-        .unwrap();
+    fn offline_transfers_are_counted_for_the_folder() {
+        let a = offline_activity(&offline_cfg(), &target_at("Docs", true), &running()).unwrap();
         assert_eq!(a.downloading, ["a/down.bin"]);
         assert_eq!(a.uploading, ["up.bin"]);
-        // `up.bin` is already uploading, so it isn't also queued.
-        assert_eq!(a.queued, ["queued.txt", "a/also.txt"]);
     }
 
     #[test]
     fn a_subfolder_or_file_only_sees_its_own_part() {
         let cfg = offline_cfg();
-        let sub = offline_activity(
-            &cfg,
-            &target_at("Docs/a", true),
-            &running(),
-            &state(&["up.bin", "queued.txt", "a/also.txt"]),
-        )
-        .unwrap();
+        let sub = offline_activity(&cfg, &target_at("Docs/a", true), &running()).unwrap();
         assert_eq!(sub.downloading, ["a/down.bin"]);
         assert_eq!(sub.uploading, Vec::<String>::new());
-        assert_eq!(sub.queued, ["a/also.txt"]);
         // A name that merely starts the same isn't inside the folder.
-        let other = offline_activity(
-            &cfg,
-            &target_at("Docs/ab", true),
-            &running(),
-            &state(&["a/also.txt"]),
-        )
-        .unwrap();
+        let other = offline_activity(&cfg, &target_at("Docs/ab", true), &running()).unwrap();
         assert_eq!(other, OfflineActivity::default());
-        let file = offline_activity(
-            &cfg,
-            &target_at("Docs/up.bin", false),
-            &running(),
-            &state(&[]),
-        )
-        .unwrap();
+        let file = offline_activity(&cfg, &target_at("Docs/up.bin", false), &running()).unwrap();
         assert_eq!(file.uploading, ["up.bin"]);
     }
 
     #[test]
     fn items_outside_offline_folders_have_no_offline_activity() {
         let cfg = offline_cfg();
-        assert!(
-            offline_activity(&cfg, &target_at("Other", true), &running(), &state(&[])).is_none()
-        );
+        assert!(offline_activity(&cfg, &target_at("Other", true), &running()).is_none());
         let off = Config {
             offline_enabled: false,
             ..cfg
         };
-        assert!(
-            offline_activity(&off, &target_at("Docs", true), &running(), &state(&[])).is_none()
-        );
+        assert!(offline_activity(&off, &target_at("Docs", true), &running()).is_none());
     }
 
     use super::*;
@@ -782,7 +720,7 @@ mod tests {
         let cache = scratch("folder");
         put(&cache, "d/a", CLEAN);
         put(&cache, "d/x.bin", DIRTY); // being uploaded
-        put(&cache, "d/y", DIRTY); // waiting its turn
+        put(&cache, "d/y", DIRTY); // changed, not transferring: not counted
         put(&cache, "d/sub/z", CLEAN);
         put(&cache, "other/w", DIRTY); // outside the folder
                                        // d/q.bin has no cache entry yet: a download in progress. "dd/x" shares the prefix
@@ -794,7 +732,6 @@ mod tests {
         };
         assert_eq!(f.uploading, 1);
         assert_eq!(f.downloading, 1);
-        assert_eq!(f.waiting_to_upload, 1);
         assert_eq!(f.cached_files, 4);
         assert_eq!(f.cached_bytes, 40);
         assert!(!f.truncated);

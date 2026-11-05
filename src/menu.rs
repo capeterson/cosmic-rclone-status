@@ -411,7 +411,7 @@ impl Menu {
             .into()
     }
 
-    // --- 2. sync status: always a title, a status line and exactly four detail rows ---
+    // --- 2. sync status: always a title, a status line and a fixed set of detail rows ---
 
     /// Icon, label and right-hand caption for the status line.
     fn status_line(&self) -> (&'static str, String, String) {
@@ -452,12 +452,6 @@ impl Menu {
                         SyncState::LocalNewer.icon(),
                         "Transferring".into(),
                         format!("{n}{more} file(s)"),
-                    )
-                } else if f.waiting_to_upload > 0 {
-                    (
-                        SyncState::QueuedUpload.icon(),
-                        SyncState::QueuedUpload.label().into(),
-                        format!("{}{more} file(s)", f.waiting_to_upload),
                     )
                 } else {
                     (
@@ -508,22 +502,11 @@ impl Menu {
                 String::new(),
             )),
             // A file inside an idle offline folder: not in the mount's cache, but here.
-            (Phase::Ready, false) if !self.is_dir => {
-                let inside = rel.strip_prefix(p.rel.as_str()).unwrap_or_default();
-                Some(if p.pending.iter().any(|n| n == inside.trim_matches('/')) {
-                    (
-                        SyncState::QueuedUpload.icon(),
-                        SyncState::QueuedUpload.label().into(),
-                        String::new(),
-                    )
-                } else {
-                    (
-                        SyncState::InSync.icon(),
-                        "Available offline".into(),
-                        String::new(),
-                    )
-                })
-            }
+            (Phase::Ready, false) if !self.is_dir => Some((
+                SyncState::InSync.icon(),
+                "Available offline".into(),
+                String::new(),
+            )),
             (Phase::Ready, false) => None,
         }
     }
@@ -539,8 +522,9 @@ impl Menu {
         Some(format!("{n} file(s), {}", human_bytes(b)))
     }
 
-    /// The four label/value pairs under the status line, with placeholders while loading.
-    fn detail_rows(&self) -> [(&'static str, String); 4] {
+    /// The label/value pairs under the status line, with placeholders while loading: four for a
+    /// file, three for a folder.
+    fn detail_rows(&self) -> Vec<(&'static str, String)> {
         let wait = |l: &Load<_>| l.ok().is_none() && l.err().is_none();
         let from_drive = |f: &dyn Fn(&DriveInfo) -> Option<String>| match &self.drive {
             Load::Pending => PLACEHOLDER.to_string(),
@@ -553,9 +537,8 @@ impl Menu {
                 _ if wait(&self.local) => PLACEHOLDER.to_string(),
                 _ => NONE.to_string(),
             };
-            return [
+            return vec![
                 ("Uploading", from_local(&|s| s.uploading.to_string())),
-                ("Queued", from_local(&|s| s.waiting_to_upload.to_string())),
                 ("Downloading", from_local(&|s| s.downloading.to_string())),
                 // An offline folder's files live in its local copy, not in the mount's cache.
                 match self.offline_copy() {
@@ -598,7 +581,7 @@ impl Menu {
             (Load::Pending, _) => PLACEHOLDER.to_string(),
             _ => NONE.to_string(),
         };
-        [
+        vec![
             (
                 "Drive modified",
                 from_drive(&|d| d.modified.map(status::fmt_time)),
@@ -653,7 +636,11 @@ impl Menu {
             );
         }
         widget::container(col)
-            .height(Length::Fixed(STATUS_H))
+            .height(Length::Fixed(if self.is_dir {
+                STATUS_H - DETAIL_ROW_H
+            } else {
+                STATUS_H
+            }))
             .width(Length::Fill)
             .into()
     }
@@ -1212,15 +1199,6 @@ mod tests {
             ("Transferring", "3 file(s)")
         );
 
-        let (_, label, detail) = folder(FolderSummary {
-            waiting_to_upload: 4,
-            ..FolderSummary::default()
-        });
-        assert_eq!(
-            (label.as_str(), detail.as_str()),
-            ("Queued for upload", "4 file(s)")
-        );
-
         let (icon, label, _) = folder(FolderSummary::default());
         assert_eq!(
             (icon, label.as_str()),
@@ -1264,11 +1242,11 @@ mod tests {
         let mut m = in_offline_folder(Phase::Ready, false);
         m.offline_usage = Some((362, 563 * 1024 * 1024));
         let rows = m.detail_rows();
-        assert_eq!(rows[3].0, "Offline copy");
-        assert!(rows[3].1.starts_with("362 file(s), 563"), "{}", rows[3].1);
+        assert_eq!(rows[2].0, "Offline copy");
+        assert!(rows[2].1.starts_with("362 file(s), 563"), "{}", rows[2].1);
         // A folder inside it isn't the pin itself, so it keeps the usual cache row.
         m.path = "/m/d/sub".into();
-        assert_eq!(m.detail_rows()[3].0, "Cached");
+        assert_eq!(m.detail_rows()[2].0, "Cached");
     }
 
     #[test]
@@ -1276,11 +1254,6 @@ mod tests {
         let mut m = in_offline_folder(Phase::Ready, false);
         m.is_dir = false;
         m.path = "/m/d/sub/a.txt".into();
-        assert_eq!(m.status_line().1, "Available offline");
-        // ...unless it has a change waiting to upload.
-        m.offline.pins[0].pending = vec!["sub/a.txt".into()];
-        assert_eq!(m.status_line().1, "Queued for upload");
-        m.offline.pins[0].pending = vec!["sub/other.txt".into()];
         assert_eq!(m.status_line().1, "Available offline");
     }
 
@@ -1345,11 +1318,11 @@ mod tests {
 
     // ---- detail rows ----
 
-    fn labels(rows: &[(&'static str, String); 4]) -> Vec<&'static str> {
+    fn labels(rows: &[(&'static str, String)]) -> Vec<&'static str> {
         rows.iter().map(|(l, _)| *l).collect()
     }
 
-    fn value<'a>(rows: &'a [(&'static str, String); 4], label: &str) -> &'a str {
+    fn value<'a>(rows: &'a [(&'static str, String)], label: &str) -> &'a str {
         rows.iter()
             .find(|(l, _)| *l == label)
             .map(|(_, v)| v.as_str())
@@ -1357,9 +1330,9 @@ mod tests {
     }
 
     #[test]
-    fn there_are_always_exactly_four_rows_with_stable_labels() {
+    fn a_file_has_four_rows_and_a_folder_three_with_stable_labels() {
         let file = ["Drive modified", "Cached locally", "Size", "Version"];
-        let folder = ["Uploading", "Queued", "Downloading", "Cached"];
+        let folder = ["Uploading", "Downloading", "Cached"];
         assert_eq!(labels(&menu(false).detail_rows()), file);
         assert_eq!(labels(&menu(true).detail_rows()), folder);
         let done = loaded(false, file_local(false, None), Ok(drive_info()));
@@ -1421,7 +1394,6 @@ mod tests {
             Local::Folder(FolderSummary {
                 uploading: 1,
                 downloading: 2,
-                waiting_to_upload: 3,
                 cached_files: 4,
                 cached_bytes: 2048,
                 truncated: true,
@@ -1431,7 +1403,6 @@ mod tests {
         .detail_rows();
         assert_eq!(value(&rows, "Uploading"), "1");
         assert_eq!(value(&rows, "Downloading"), "2");
-        assert_eq!(value(&rows, "Queued"), "3");
         assert_eq!(value(&rows, "Cached"), "4+ file(s), 2.0 KiB");
     }
 

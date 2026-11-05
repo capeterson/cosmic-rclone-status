@@ -217,14 +217,7 @@ pub struct PinState {
     /// the first successful sync by id; a different id for the same path means the cloud folder
     /// was deleted and recreated, which must not be synced against the old baseline.
     pub folder_id: Option<String>,
-    /// Files changed in the local copy since the last sync (paths inside the folder, at most
-    /// [`PENDING_CAP`]); they upload with the next sync. The keeper keeps this up to date so the
-    /// "rclone…" window can show them as queued.
-    pub pending: Vec<String>,
 }
-
-/// How many pending paths the keeper reports per folder.
-pub const PENDING_CAP: usize = 1000;
 
 /// How much of a folder's local copy is on disk: (files, bytes).
 pub fn local_usage(rel: &str) -> (u64, u64) {
