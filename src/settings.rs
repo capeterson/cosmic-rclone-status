@@ -226,7 +226,7 @@ impl cosmic::Application for App {
 
     fn init(mut core: cosmic::Core, cfg: Config) -> (Self, Task) {
         core.window.show_maximize = false;
-        core.set_header_title("rclone Status settings".into());
+        core.set_header_title("rclone UI settings".into());
         let app = App {
             core,
             cfg,
@@ -610,7 +610,7 @@ mod tests {
         let fuse = &items[0].1;
         assert!(fuse.contains("administrator password"), "{fuse}");
         assert!(
-            fuse.contains("/etc/fuse.conf.cosmic-rclone-status-<date-time>.bak"),
+            fuse.contains("/etc/fuse.conf.cosmic-rclone-ui-<date-time>.bak"),
             "{fuse}"
         );
         assert!(items[2]

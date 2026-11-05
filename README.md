@@ -1,4 +1,4 @@
-# cosmic-rclone-status
+# cosmic-rclone-ui
 
 A [COSMIC](https://github.com/pop-os/cosmic-epoch) panel applet that shows the status of an
 [rclone](https://rclone.org) mount: synced, uploading, downloading, both, error, or mount down.
@@ -13,13 +13,16 @@ Status is read from rclone's remote-control API (`--rc`: `core/stats`, `vfs/stat
 
 - COSMIC desktop, Rust toolchain, and libcosmic's system dev libraries
   (`libxkbcommon-dev libfontconfig-dev libfreetype-dev libexpat1-dev libudev-dev libinput-dev libegl-dev libgbm-dev wayland-protocols`)
+- **rclone 1.75.0 or newer** (minimum supported version; last verified with 1.75.2). The popup
+  shows a warning when the running rclone is older. We raise this minimum whenever the app starts
+  relying on a newer rclone feature, so check it when upgrading the app.
 - rclone mounted by a systemd **user** service with the rc API enabled and authenticated, e.g.
   `rclone mount remote: ~/Drive --rc --rc-addr 127.0.0.1:5572` with `RCLONE_RC_USER` / `RCLONE_RC_PASS`
   provided through an `EnvironmentFile`.
 
 ## Configuration
 
-Defaults (stored in cosmic-config under `com.ca-peterson.CosmicRcloneStatus`):
+Defaults (stored in cosmic-config under `com.ca-peterson.CosmicRcloneUi`):
 
 | Key | Default |
 |---|---|
@@ -44,24 +47,27 @@ Settings, then right-click a folder in COSMIC Files → **rclone…** → **Keep
 
 How it works:
 
-- The folder's local copy lives in `~/.local/share/cosmic-rclone-status/offline/<id>` and is
+- The folder's local copy lives in `~/.local/share/cosmic-rclone-ui/offline/<id>` and is
   synced with `rclone bisync`, run *inside the mount's own rclone process* through its rc API
   (`sync/bisync`), so there is no second rclone config or login. A background user service
-  (`cosmic-rclone-status-offline.service`) runs each sync: every `sync_interval_secs`, and about
+  (`cosmic-rclone-ui-offline.service`) runs each sync: every `sync_interval_secs`, and about
   10 seconds after a local change.
 - The local copy is mounted on top of the folder's place in the Drive folder
-  (`cosmic-rclone-status-pin@<id>.service`), so it shows up in place. Both services are bound to
+  (`cosmic-rclone-ui-pin@<id>.service`), so it shows up in place. Both services are bound to
   the mount's service and start and stop with it; a folder that has been downloaded is mounted
   even when offline.
 - Conflicts (the same file changed on both sides between syncs) are resolved as *newer wins*:
   the older edit is uploaded first, so it stays in the file's version history in Google Drive
   ("Manage versions"; Drive keeps old versions of uploaded files for about 30 days or 100
   versions unless one is marked "Keep forever"). You get a notification.
+- Renaming or moving a file or folder (on either side) is a move in the cloud, not a second
+  upload, and a sync that is cut off (crash, reboot, lost connection) recovers by itself on the
+  next run.
 - Native Google Docs, Sheets and Slides are left out of the offline copy (rclone can only
   download exports of them, which can't be synced back); they still open from the main mount.
 - If bisync stops for safety (too many deletions, or the folder vanished in the cloud), the
   folder is marked **Needs attention**; **Repair** in Settings merges both sides without deleting
-  anything.
+  anything (when a file differs on both sides, the newer one is kept).
 - Unpinning uploads the last changes first (it waits if you're offline), then unmounts and deletes
   the local copy.
 
@@ -69,12 +75,12 @@ Turning the switch on first shows a dialog listing every change setup will make 
 not already done); **Continue** goes on to the password prompt, **Cancel** changes nothing and
 leaves the switch off. If setup can't finish (for example the password prompt is dismissed), it
 is undone and the switch goes back off. Before `/etc/fuse.conf` is edited it is copied to
-`/etc/fuse.conf.cosmic-rclone-status-<date-time>.bak`; if that copy fails the file is left alone.
+`/etc/fuse.conf.cosmic-rclone-ui-<date-time>.bak`; if that copy fails the file is left alone.
 
 What setup does: mounting inside the Drive mount needs the Drive mount to use
 `--allow-other`, which ordinary users can only request once `user_allow_other` is set in
 `/etc/fuse.conf` (one line, added through the system password prompt). The app then adds a
-drop-in for the mount's service (`<service>.d/50-cosmic-rclone-status.conf`) that sets
+drop-in for the mount's service (`<service>.d/50-cosmic-rclone-ui.conf`) that sets
 `--allow-other` together with `--default-permissions` and a `077` umask, so other users still
 can't open your files, and restarts the mount once. Turning offline folders off removes the
 services and the drop-in; the `/etc/fuse.conf` line is left in place.
@@ -121,19 +127,18 @@ cargo install just
 just install-user      # builds and installs under ~/.local
 ```
 
-Then add "rclone Status" in COSMIC Settings → Desktop → Panel → Configure panel applets.
-`cosmic-rclone-status --status` prints one status snapshot without the panel.
+Then add "rclone UI" in COSMIC Settings → Desktop → Panel → Configure panel applets.
+`cosmic-rclone-ui --status` prints one status snapshot without the panel.
 
 ## Notes
 
-rclone does not report transfer direction, so a transfer counts as a download when there are more
-active transfers than VFS uploads in progress. This is a heuristic.
+A running transfer counts as a download when rclone reports a source but no destination (a read
+through the mount), and as an upload when it has both (a write-back from the VFS cache, or a sync).
 
 The recent-files history comes from rclone's in-memory list of completed transfers, so it
 starts empty and resets when rclone restarts. Repeats of the same file are shown as one row
 (`×N`) at its latest time, and new entries appear after a 2 second delay so the list doesn't
-jump on every poll. Newer rclone versions report each transfer's source and destination; when
-they do, rows get an upload or download arrow. Older versions (such as 1.60) show no arrow.
+jump on every poll. rclone reports each transfer's source and destination, so rows get an upload or download arrow.
 File icons are chosen from the file name alone (shared-mime-info plus your icon theme); files
 are never read, so nothing is downloaded to draw the list.
 
@@ -143,15 +148,25 @@ are never read, so nothing is downloaded to draw the list.
   doesn't say whether a file was new or changed, and keeps no record of deletions at all (they are
   only logged at debug level). So for the rest of the Drive folder, rows have no kind icon, and
   files deleted there (or on another device) don't appear.
-- **Direction arrows need a newer rclone outside offline folders.** rclone 1.60 doesn't report
-  where a transfer went; newer versions add `srcFs`/`dstFs`, and rows then get an arrow.
-- **Offline folders are folders only**, can't be nested inside each other, and very long folder
-  paths are refused (rclone 1.60's bisync names its working files after both full paths).
+- **Offline folders are folders only**, can't be nested inside each other, and syncing is by the
+  folder's Google Drive id. A folder that is renamed or moved in Drive needs to be taken offline
+  again, and one deleted and recreated under the same name stops with **Needs attention** (Repair
+  merges both sides). Only non-Drive remotes sync by path, and those refuse very long folder paths
+  (rclone's bisync names its working files after both paths).
+- **Renaming a folder that holds more than half of an offline folder's files** looks like mass
+  deletion to bisync, even with rename tracking, so it stops with **Needs attention**; Repair
+  fixes it. (`--max-delete-renames-aware` arrived after rclone 1.75.)
 - **Moving a file into or out of an offline folder** is a copy plus a delete, because it crosses
   mounts.
-- **rclone 1.60 workarounds**: through the rc API, bisync's delete limit is stuck at 0% and its
-  "all files changed" check trips on small folders, so the keeper makes those checks itself (at
-  most half of a folder, or 3 files, deleted per sync) and then runs bisync with `force`.
+- **Deleting everything in an offline folder** (either side) is refused by bisync as an unsafe
+  empty listing; Repair brings the files back.
+- Files named `*.partial` are never synced in offline folders (rclone's temporary files).
+
+## Tests against rclone
+
+`just test` runs the unit tests. `just test-live` also runs the ones that drive the installed
+rclone through its rc API (renames, conflicts, delete limits, failure messages). Run it after
+upgrading rclone, and before raising the minimum version above.
 
 ## License
 

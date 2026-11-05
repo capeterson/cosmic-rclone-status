@@ -17,12 +17,13 @@ mod status;
 #[cfg(test)]
 mod testutil;
 mod units;
+mod version;
 
 /// Build with `APP_ID_OVERRIDE=...` to get a side-by-side dev copy with its own panel
 /// identity and config (see `just install-dev`).
 pub const APP_ID: &str = match option_env!("APP_ID_OVERRIDE") {
     Some(id) => id,
-    None => "com.ca-peterson.CosmicRcloneStatus",
+    None => "com.ca-peterson.CosmicRcloneUi",
 };
 
 fn main() -> cosmic::iced::Result {
@@ -64,7 +65,7 @@ fn main() -> cosmic::iced::Result {
         }
         return Ok(());
     }
-    // `cosmic-rclone-status --status [--rc-addr HOST:PORT]` prints one status snapshot and
+    // `cosmic-rclone-ui --status [--rc-addr HOST:PORT]` prints one status snapshot and
     // exits (handy for debugging and used by the smoke test).
     if args.iter().any(|a| a == "--status") {
         let mut cfg = config::Config::load(APP_ID);

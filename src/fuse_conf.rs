@@ -13,7 +13,7 @@ use std::process::Command;
 pub const PATH: &str = "/etc/fuse.conf";
 
 /// The backup's name is `<file>` + this + a timestamp + `.bak`, next to the original.
-pub const BACKUP_INFIX: &str = ".cosmic-rclone-status-";
+pub const BACKUP_INFIX: &str = ".cosmic-rclone-ui-";
 
 /// Run as `sh -c ENABLE_SCRIPT sh <fuse.conf path>` (through pkexec for the real file). Adds the
 /// line unless it's already there, creating the file if needed. Before changing an existing file
@@ -22,11 +22,11 @@ pub const BACKUP_INFIX: &str = ".cosmic-rclone-status-";
 const ENABLE_SCRIPT: &str = r#"f="$1"
 if [ -f "$f" ] && grep -qxE '[[:space:]]*user_allow_other[[:space:]]*' "$f"; then exit 0; fi
 if [ -e "$f" ]; then
-  b="$f.cosmic-rclone-status-$(date +%Y%m%d-%H%M%S).bak"
+  b="$f.cosmic-rclone-ui-$(date +%Y%m%d-%H%M%S).bak"
   cp -p "$f" "$b" || exit 3
   echo "$b"
 fi
-printf '\n# Added by cosmic-rclone-status for offline folders\nuser_allow_other\n' >> "$f" || exit 4
+printf '\n# Added by cosmic-rclone-ui for offline folders\nuser_allow_other\n' >> "$f" || exit 4
 "#;
 
 /// Run the script on `path`, through `prefix` (e.g. `pkexec`) if given. Returns the backup's
