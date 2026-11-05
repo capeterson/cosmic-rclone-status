@@ -473,7 +473,7 @@ pub fn request_repair(rel: &str) -> std::io::Result<()> {
 fn desktop_notify(text: &str) {
     let _ = Command::new("notify-send")
         .args([
-            "--app-name=rclone Status",
+            "--app-name=rclone UI",
             "--icon=folder-sync-symbolic",
             "Offline folders",
             text,

@@ -20,7 +20,7 @@ impl Sandbox {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_cosmic-rclone-status"))
+        Command::new(env!("CARGO_BIN_EXE_cosmic-rclone-ui"))
             .args(args)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join("config"))
@@ -67,7 +67,7 @@ fn menu_install_adds_one_entry_that_runs_this_binary() {
     assert_eq!(text.matches("name:").count(), 1, "{text}");
     assert!(text.contains("rclone…"), "{text}");
     assert!(text.contains("--menu %F"), "{text}");
-    assert!(text.contains("cosmic-rclone-status"), "{text}");
+    assert!(text.contains("cosmic-rclone-ui"), "{text}");
 }
 
 #[test]

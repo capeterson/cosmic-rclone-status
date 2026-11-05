@@ -2,7 +2,7 @@
 //! Registers the single "rclone…" entry in COSMIC Files' right-click menu.
 //!
 //! COSMIC Files has no extension API, only a `context_actions` list in its own config, rendered
-//! flat. We add one entry that runs `cosmic-rclone-status --menu %F` (see `menu.rs`); everything
+//! flat. We add one entry that runs `cosmic-rclone-ui --menu %F` (see `menu.rs`); everything
 //! else lives in that window. The user's other entries are left alone.
 
 use cosmic::cosmic_config::{Config as CosmicConfig, ConfigGet, ConfigSet};

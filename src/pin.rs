@@ -29,9 +29,9 @@ const RETRY_BASE_SECS: i64 = 30;
 /// The folder name used for this build's data and state (the dev build keeps its own).
 pub fn app_dir_name() -> &'static str {
     if crate::APP_ID.ends_with("Dev") {
-        "cosmic-rclone-status-dev"
+        "cosmic-rclone-ui-dev"
     } else {
-        "cosmic-rclone-status"
+        "cosmic-rclone-ui"
     }
 }
 
@@ -42,12 +42,12 @@ fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
         .join(app_dir_name())
 }
 
-/// `$XDG_DATA_HOME/cosmic-rclone-status`: the local copies live under here.
+/// `$XDG_DATA_HOME/cosmic-rclone-ui`: the local copies live under here.
 pub fn data_dir() -> PathBuf {
     xdg_dir("XDG_DATA_HOME", "~/.local/share")
 }
 
-/// `$XDG_STATE_HOME/cosmic-rclone-status`: bisync's working files and `offline.json`.
+/// `$XDG_STATE_HOME/cosmic-rclone-ui`: bisync's working files and `offline.json`.
 pub fn state_dir() -> PathBuf {
     xdg_dir("XDG_STATE_HOME", "~/.local/state")
 }

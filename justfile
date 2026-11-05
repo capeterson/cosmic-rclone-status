@@ -1,5 +1,5 @@
-name := 'cosmic-rclone-status'
-appid := 'com.ca-peterson.CosmicRcloneStatus'
+name := 'cosmic-rclone-ui'
+appid := 'com.ca-peterson.CosmicRcloneUi'
 
 default: build-release
 
@@ -32,13 +32,13 @@ uninstall-user:
     if [ -x ~/.local/bin/{{name}} ]; then ~/.local/bin/{{name}} --offline-remove; fi
     rm -f ~/.local/bin/{{name}} ~/.local/share/applications/{{appid}}.desktop ~/.local/share/icons/hicolor/scalable/apps/{{appid}}-symbolic.svg
 
-devid := 'com.ca-peterson.CosmicRcloneStatusDev'
+devid := 'com.ca-peterson.CosmicRcloneUiDev'
 
-# Install a side-by-side dev copy ("rclone Status (dev)") that doesn't touch the real applet
+# Install a side-by-side dev copy ("rclone UI (dev)") that doesn't touch the real applet
 install-dev:
     APP_ID_OVERRIDE={{devid}} cargo build --release
     install -Dm0755 target/release/{{name}} ~/.local/bin/{{name}}-dev
-    sed -e 's/^Name=.*/Name=rclone Status (dev)/' -e 's/^Exec=.*/Exec={{name}}-dev/' resources/{{appid}}.desktop > /tmp/{{devid}}.desktop
+    sed -e 's/^Name=.*/Name=rclone UI (dev)/' -e 's/^Exec=.*/Exec={{name}}-dev/' resources/{{appid}}.desktop > /tmp/{{devid}}.desktop
     install -Dm0644 /tmp/{{devid}}.desktop ~/.local/share/applications/{{devid}}.desktop
     rm -f /tmp/{{devid}}.desktop
     cargo build --release  # restore the normal build in target/

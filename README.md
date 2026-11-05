@@ -1,4 +1,4 @@
-# cosmic-rclone-status
+# cosmic-rclone-ui
 
 A [COSMIC](https://github.com/pop-os/cosmic-epoch) panel applet that shows the status of an
 [rclone](https://rclone.org) mount: synced, uploading, downloading, both, error, or mount down.
@@ -19,7 +19,7 @@ Status is read from rclone's remote-control API (`--rc`: `core/stats`, `vfs/stat
 
 ## Configuration
 
-Defaults (stored in cosmic-config under `com.ca-peterson.CosmicRcloneStatus`):
+Defaults (stored in cosmic-config under `com.ca-peterson.CosmicRcloneUi`):
 
 | Key | Default |
 |---|---|
@@ -44,13 +44,13 @@ Settings, then right-click a folder in COSMIC Files → **rclone…** → **Keep
 
 How it works:
 
-- The folder's local copy lives in `~/.local/share/cosmic-rclone-status/offline/<id>` and is
+- The folder's local copy lives in `~/.local/share/cosmic-rclone-ui/offline/<id>` and is
   synced with `rclone bisync`, run *inside the mount's own rclone process* through its rc API
   (`sync/bisync`), so there is no second rclone config or login. A background user service
-  (`cosmic-rclone-status-offline.service`) runs each sync: every `sync_interval_secs`, and about
+  (`cosmic-rclone-ui-offline.service`) runs each sync: every `sync_interval_secs`, and about
   10 seconds after a local change.
 - The local copy is mounted on top of the folder's place in the Drive folder
-  (`cosmic-rclone-status-pin@<id>.service`), so it shows up in place. Both services are bound to
+  (`cosmic-rclone-ui-pin@<id>.service`), so it shows up in place. Both services are bound to
   the mount's service and start and stop with it; a folder that has been downloaded is mounted
   even when offline.
 - Conflicts (the same file changed on both sides between syncs) are resolved as *newer wins*:
@@ -69,12 +69,12 @@ Turning the switch on first shows a dialog listing every change setup will make 
 not already done); **Continue** goes on to the password prompt, **Cancel** changes nothing and
 leaves the switch off. If setup can't finish (for example the password prompt is dismissed), it
 is undone and the switch goes back off. Before `/etc/fuse.conf` is edited it is copied to
-`/etc/fuse.conf.cosmic-rclone-status-<date-time>.bak`; if that copy fails the file is left alone.
+`/etc/fuse.conf.cosmic-rclone-ui-<date-time>.bak`; if that copy fails the file is left alone.
 
 What setup does: mounting inside the Drive mount needs the Drive mount to use
 `--allow-other`, which ordinary users can only request once `user_allow_other` is set in
 `/etc/fuse.conf` (one line, added through the system password prompt). The app then adds a
-drop-in for the mount's service (`<service>.d/50-cosmic-rclone-status.conf`) that sets
+drop-in for the mount's service (`<service>.d/50-cosmic-rclone-ui.conf`) that sets
 `--allow-other` together with `--default-permissions` and a `077` umask, so other users still
 can't open your files, and restarts the mount once. Turning offline folders off removes the
 services and the drop-in; the `/etc/fuse.conf` line is left in place.
@@ -121,8 +121,8 @@ cargo install just
 just install-user      # builds and installs under ~/.local
 ```
 
-Then add "rclone Status" in COSMIC Settings → Desktop → Panel → Configure panel applets.
-`cosmic-rclone-status --status` prints one status snapshot without the panel.
+Then add "rclone UI" in COSMIC Settings → Desktop → Panel → Configure panel applets.
+`cosmic-rclone-ui --status` prints one status snapshot without the panel.
 
 ## Notes
 
