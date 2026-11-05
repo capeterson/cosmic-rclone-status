@@ -999,6 +999,9 @@ pub fn pin_mount(id: &str) -> Result<(), String> {
         .arg("mount")
         .arg(&local)
         .arg(&mp)
+        // The folder is mounted over its own place in the Drive mount, which lists the cloud copy.
+        // (rclone checks this properly since 1.62 and refuses without the flag.)
+        .arg("--allow-non-empty")
         // Editors need read-write opens and seeks, which need at least the writes cache.
         .args(["--vfs-cache-mode", "writes", "--vfs-write-back", "1s"])
         .arg("--cache-dir")
