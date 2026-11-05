@@ -29,6 +29,21 @@ pub struct Transfer {
     pub percentage: u64,
     #[serde(default)]
     pub speed: f64,
+    /// Where the transfer reads from and writes to (rclone 1.66+). A read through the mount has no
+    /// destination; a VFS upload goes from the cache directory to the remote.
+    #[serde(default, rename = "srcFs")]
+    pub src_fs: Option<String>,
+    #[serde(default, rename = "dstFs")]
+    pub dst_fs: Option<String>,
+}
+
+impl Transfer {
+    pub fn direction(&self) -> Option<Direction> {
+        match (&self.src_fs, &self.dst_fs) {
+            (Some(_), None) => Some(Direction::Download),
+            (src, dst) => direction(src.as_deref(), dst.as_deref()),
+        }
+    }
 }
 
 /// Which way a completed transfer went. Known when rclone reports `srcFs`/`dstFs` (newer
@@ -204,9 +219,18 @@ pub struct Status {
     pub transfers: Vec<Transfer>,
     /// Recently completed transfers, newest first, at most [`HISTORY_CAP`].
     pub recent: Vec<CompletedTransfer>,
+    /// The version of the running rclone (`core/version`), when it answered.
+    pub rclone_version: Option<String>,
 }
 
 impl Status {
+    /// The running rclone's version, if it is older than [`crate::version::MIN_RCLONE`].
+    pub fn outdated_rclone(&self) -> Option<&str> {
+        self.rclone_version
+            .as_deref()
+            .filter(|v| crate::version::is_too_old(v))
+    }
+
     pub fn health(&self) -> Health {
         if !self.service_active {
             Health::ServiceStopped
@@ -246,12 +270,17 @@ impl Status {
     /// Files are queued or being sent to the remote.
     pub fn uploading(&self) -> bool {
         self.uploads_in_progress + self.uploads_queued > 0
+            || self
+                .transfers
+                .iter()
+                .any(|t| t.direction() == Some(Direction::Upload))
     }
 
-    /// rclone lists uploads and downloads together in `core/stats`, without a direction.
-    /// The VFS tells us how many of those are uploads, so any surplus must be downloads.
+    /// Something is being read from the remote.
     pub fn downloading(&self) -> bool {
-        self.transfers.len() as u64 > self.uploads_in_progress
+        self.transfers
+            .iter()
+            .any(|t| t.direction() == Some(Direction::Download))
     }
 }
 
@@ -471,6 +500,13 @@ struct RcStats {
     core: CoreStats,
     vfs: VfsStats,
     transferred: Vec<RawTransferred>,
+    version: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct VersionResp {
+    version: String,
 }
 
 fn fetch_rc(addr: &str, auth: Option<&str>, timeout: Duration) -> Result<RcStats, String> {
@@ -481,11 +517,17 @@ fn fetch_rc(addr: &str, auth: Option<&str>, timeout: Duration) -> Result<RcStats
     let transferred = rc_call::<TransferredResp>(&agent, addr, auth, "core/transferred")
         .map(|r| r.transferred)
         .unwrap_or_default();
+    // Also best-effort: only used for the "rclone is too old" alert.
+    let version = rc_call::<VersionResp>(&agent, addr, auth, "core/version")
+        .ok()
+        .map(|v| v.version)
+        .filter(|v| !v.is_empty());
     match (core, vfs) {
         (Ok(core), Ok(vfs)) => Ok(RcStats {
             core,
             vfs,
             transferred,
+            version,
         }),
         (Err(e), _) | (_, Err(e)) => Err(e),
     }
@@ -507,6 +549,7 @@ fn assemble(service_active: bool, mounted: bool, rc: Option<Result<RcStats, Stri
         last_error: None,
         transfers: vec![],
         recent: vec![],
+        rclone_version: None,
     };
     match rc {
         None => {}
@@ -515,7 +558,9 @@ fn assemble(service_active: bool, mounted: bool, rc: Option<Result<RcStats, Stri
             core,
             vfs,
             transferred,
+            version,
         })) => {
+            st.rclone_version = version;
             let d = vfs.disk_cache;
             st.uploads_in_progress = d.uploads_in_progress;
             st.uploads_queued = d.uploads_queued;
@@ -612,7 +657,7 @@ mod tests {
         s.uploads_in_progress = 1;
         assert!((s.display_speed() - 123.0).abs() < f64::EPSILON);
         s.uploads_in_progress = 0;
-        s.transfers = transfers(1);
+        s.transfers = downloads(1);
         assert!((s.display_speed() - 123.0).abs() < f64::EPSILON);
         // Queued but not started is not moving data yet.
         s.transfers = vec![];
@@ -662,10 +707,29 @@ mod tests {
         assert_eq!(s.health(), Health::CacheFull);
     }
 
-    // ---- direction heuristic -------------------------------------------
+    // ---- direction -----------------------------------------------------
 
-    fn transfers(n: usize) -> Vec<Transfer> {
-        vec![Transfer::default(); n]
+    /// A read through the mount: from the remote, to nowhere.
+    fn downloads(n: usize) -> Vec<Transfer> {
+        vec![
+            Transfer {
+                src_fs: Some("gd:".into()),
+                ..Transfer::default()
+            };
+            n
+        ]
+    }
+
+    /// A VFS write-back: from the cache directory to the remote.
+    fn uploads(n: usize) -> Vec<Transfer> {
+        vec![
+            Transfer {
+                src_fs: Some("/home/u/.cache/rclone/vfs/gd".into()),
+                dst_fs: Some("gd:".into()),
+                ..Transfer::default()
+            };
+            n
+        ]
     }
 
     #[test]
@@ -676,28 +740,37 @@ mod tests {
     }
 
     #[test]
-    fn surplus_transfers_are_downloads() {
+    fn reads_without_a_destination_are_downloads() {
         let mut s = status();
-        s.transfers = transfers(2);
+        s.transfers = downloads(2);
         assert_eq!(s.health(), Health::Downloading);
     }
 
     #[test]
     fn mixed_is_transferring() {
         let mut s = status();
-        s.transfers = transfers(3);
+        s.transfers = downloads(2);
+        s.transfers.extend(uploads(1));
         s.uploads_in_progress = 1;
         assert_eq!(s.health(), Health::Transferring);
     }
 
     #[test]
-    fn more_uploads_than_transfers_is_not_a_download() {
-        // core and vfs stats are sampled at different moments, so this can happen.
+    fn an_upload_is_not_a_download() {
+        // core and vfs stats are sampled at different moments, so the VFS counters can lag.
         let mut s = status();
-        s.transfers = transfers(1);
-        s.uploads_in_progress = 2;
+        s.transfers = uploads(1);
         assert!(!s.downloading());
         assert_eq!(s.health(), Health::Uploading);
+        s.uploads_in_progress = 2;
+        assert_eq!(s.health(), Health::Uploading);
+    }
+
+    #[test]
+    fn a_transfer_with_no_fs_info_counts_as_neither() {
+        let mut s = status();
+        s.transfers = vec![Transfer::default()];
+        assert!(!s.downloading());
     }
 
     // ---- human ---------------------------------------------------------

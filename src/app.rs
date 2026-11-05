@@ -167,6 +167,9 @@ fn detail_lines(st: &Status) -> Vec<String> {
     if let Some(e) = &st.rc_error {
         lines.push(format!("rc unreachable: {e}"));
     }
+    if let Some(v) = &st.rclone_version {
+        lines.push(format!("rclone {v}"));
+    }
     lines.push(format!(
         "Uploads: {} in progress, {} queued",
         st.uploads_in_progress, st.uploads_queued
@@ -188,6 +191,28 @@ fn detail_lines(st: &Status) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// The banner shown when the running rclone is older than the minimum this app supports.
+fn outdated_alert(version: &str) -> Element<'static, Message> {
+    widget::Row::new()
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .push(widget::icon::from_name("dialog-warning-symbolic").size(20))
+        .push(
+            widget::text::body(outdated_text(version))
+                .width(Length::Fill)
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word),
+        )
+        .into()
+}
+
+fn outdated_text(version: &str) -> String {
+    format!(
+        "rclone {version} is older than the {} this app needs. Update rclone, then restart \
+         the mount; some features may misbehave until you do.",
+        crate::version::MIN_RCLONE
+    )
 }
 
 /// "Offline: 2 folders · all available offline", or a nudge to finish setup.
@@ -438,6 +463,10 @@ impl AppModel {
             col = col.push(header);
         } else {
             col = col.push(title);
+        }
+
+        if let Some(v) = self.status.as_ref().and_then(Status::outdated_rclone) {
+            col = col.push(outdated_alert(v));
         }
 
         if let Some(row) = self.offline_row() {
@@ -705,7 +734,19 @@ mod tests {
             last_error: None,
             transfers: vec![],
             recent: vec![],
+            rclone_version: None,
         }
+    }
+
+    #[test]
+    fn old_rclone_is_flagged_and_current_is_not() {
+        let mut s = status();
+        assert_eq!(s.outdated_rclone(), None);
+        s.rclone_version = Some("v1.60.1".into());
+        assert_eq!(s.outdated_rclone(), Some("v1.60.1"));
+        assert!(outdated_text("v1.60.1").contains(crate::version::MIN_RCLONE));
+        s.rclone_version = Some(format!("v{}", crate::version::MIN_RCLONE));
+        assert_eq!(s.outdated_rclone(), None);
     }
 
     #[test]

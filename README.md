@@ -13,6 +13,9 @@ Status is read from rclone's remote-control API (`--rc`: `core/stats`, `vfs/stat
 
 - COSMIC desktop, Rust toolchain, and libcosmic's system dev libraries
   (`libxkbcommon-dev libfontconfig-dev libfreetype-dev libexpat1-dev libudev-dev libinput-dev libegl-dev libgbm-dev wayland-protocols`)
+- **rclone 1.75.0 or newer** (minimum supported version; last verified with 1.75.2). The popup
+  shows a warning when the running rclone is older. We raise this minimum whenever the app starts
+  relying on a newer rclone feature, so check it when upgrading the app.
 - rclone mounted by a systemd **user** service with the rc API enabled and authenticated, e.g.
   `rclone mount remote: ~/Drive --rc --rc-addr 127.0.0.1:5572` with `RCLONE_RC_USER` / `RCLONE_RC_PASS`
   provided through an `EnvironmentFile`.
@@ -57,11 +60,14 @@ How it works:
   the older edit is uploaded first, so it stays in the file's version history in Google Drive
   ("Manage versions"; Drive keeps old versions of uploaded files for about 30 days or 100
   versions unless one is marked "Keep forever"). You get a notification.
+- Renaming or moving a file or folder (on either side) is a move in the cloud, not a second
+  upload, and a sync that is cut off (crash, reboot, lost connection) recovers by itself on the
+  next run.
 - Native Google Docs, Sheets and Slides are left out of the offline copy (rclone can only
   download exports of them, which can't be synced back); they still open from the main mount.
 - If bisync stops for safety (too many deletions, or the folder vanished in the cloud), the
   folder is marked **Needs attention**; **Repair** in Settings merges both sides without deleting
-  anything.
+  anything (when a file differs on both sides, the newer one is kept).
 - Unpinning uploads the last changes first (it waits if you're offline), then unmounts and deletes
   the local copy.
 
@@ -126,14 +132,13 @@ Then add "rclone UI" in COSMIC Settings → Desktop → Panel → Configure pane
 
 ## Notes
 
-rclone does not report transfer direction, so a transfer counts as a download when there are more
-active transfers than VFS uploads in progress. This is a heuristic.
+A running transfer counts as a download when rclone reports a source but no destination (a read
+through the mount), and as an upload when it has both (a write-back from the VFS cache, or a sync).
 
 The recent-files history comes from rclone's in-memory list of completed transfers, so it
 starts empty and resets when rclone restarts. Repeats of the same file are shown as one row
 (`×N`) at its latest time, and new entries appear after a 2 second delay so the list doesn't
-jump on every poll. Newer rclone versions report each transfer's source and destination; when
-they do, rows get an upload or download arrow. Older versions (such as 1.60) show no arrow.
+jump on every poll. rclone reports each transfer's source and destination, so rows get an upload or download arrow.
 File icons are chosen from the file name alone (shared-mime-info plus your icon theme); files
 are never read, so nothing is downloaded to draw the list.
 
@@ -143,15 +148,25 @@ are never read, so nothing is downloaded to draw the list.
   doesn't say whether a file was new or changed, and keeps no record of deletions at all (they are
   only logged at debug level). So for the rest of the Drive folder, rows have no kind icon, and
   files deleted there (or on another device) don't appear.
-- **Direction arrows need a newer rclone outside offline folders.** rclone 1.60 doesn't report
-  where a transfer went; newer versions add `srcFs`/`dstFs`, and rows then get an arrow.
-- **Offline folders are folders only**, can't be nested inside each other, and very long folder
-  paths are refused (rclone 1.60's bisync names its working files after both full paths).
+- **Offline folders are folders only**, can't be nested inside each other, and syncing is by the
+  folder's Google Drive id. A folder that is renamed or moved in Drive needs to be taken offline
+  again, and one deleted and recreated under the same name stops with **Needs attention** (Repair
+  merges both sides). Only non-Drive remotes sync by path, and those refuse very long folder paths
+  (rclone's bisync names its working files after both paths).
+- **Renaming a folder that holds more than half of an offline folder's files** looks like mass
+  deletion to bisync, even with rename tracking, so it stops with **Needs attention**; Repair
+  fixes it. (`--max-delete-renames-aware` arrived after rclone 1.75.)
 - **Moving a file into or out of an offline folder** is a copy plus a delete, because it crosses
   mounts.
-- **rclone 1.60 workarounds**: through the rc API, bisync's delete limit is stuck at 0% and its
-  "all files changed" check trips on small folders, so the keeper makes those checks itself (at
-  most half of a folder, or 3 files, deleted per sync) and then runs bisync with `force`.
+- **Deleting everything in an offline folder** (either side) is refused by bisync as an unsafe
+  empty listing; Repair brings the files back.
+- Files named `*.partial` are never synced in offline folders (rclone's temporary files).
+
+## Tests against rclone
+
+`just test` runs the unit tests. `just test-live` also runs the ones that drive the installed
+rclone through its rc API (renames, conflicts, delete limits, failure messages). Run it after
+upgrading rclone, and before raising the minimum version above.
 
 ## License
 

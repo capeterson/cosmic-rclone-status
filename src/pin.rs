@@ -8,8 +8,8 @@
 //! - a mount of that copy on top of `<mount>/Work/Taxes`, so it shows up in place.
 //!
 //! `<id>` is a short hash of the path. bisync names its lock and listing files after both full
-//! paths and rclone 1.60 can't cope when that name is longer than a file name may be, so the
-//! local side is kept short.
+//! paths and (still, as of rclone 1.75) can't cope when that name is longer than a file name may
+//! be, so the local side is kept short and the cloud side is addressed by its Drive id.
 
 use crate::config::{expand, Config};
 use crate::rc::{ChangeKind, Direction};
@@ -95,6 +95,14 @@ pub fn remote(fs: &str, rel: &str) -> String {
     format!("{name},skip_gdocs=true:{path}")
 }
 
+/// Like [`remote`], but addressing the folder by its Drive id (`root_folder_id`). bisync names its
+/// working files after both paths; with the id the cloud side contributes only the remote's name,
+/// so a deep cloud path no longer overflows a file name.
+pub fn remote_by_id(fs: &str, id: &str) -> String {
+    let name = fs.split_once(':').map_or(fs, |(n, _)| n);
+    format!("{name},skip_gdocs=true,root_folder_id={id}:")
+}
+
 /// The pinned folder that `rel` is, or is inside of.
 pub fn covering_pin<'a>(pins: &'a [String], rel: &str) -> Option<&'a str> {
     pins.iter()
@@ -130,11 +138,18 @@ pub fn normalize(
             "Contains {p}, which is already kept offline; remove that first"
         ));
     }
-    let session = session_name(&remote(fs, &rel), &local_dir(&rel).to_string_lossy());
+    // Folders are synced by Drive id, so only the remote's name and the local path count. (If the
+    // id can't be looked up the keeper falls back to the path and checks again.)
+    let session = session_name(&remote_by_id(fs, ""), &local_dir(&rel).to_string_lossy());
     if session.len() > SESSION_NAME_MAX {
         return Err("The folder's path is too long for rclone bisync".into());
     }
     Ok(rel)
+}
+
+/// Does bisync's working-file name for these two paths fit in a file name?
+pub fn session_fits(path1: &str, path2: &str) -> bool {
+    session_name(path1, path2).len() <= SESSION_NAME_MAX
 }
 
 /// Roughly how bisync names its working files: both paths with separators flattened.
@@ -198,6 +213,10 @@ pub struct PinState {
     pub error: Option<String>,
     /// A sync is running right now.
     pub syncing: bool,
+    /// The Google Drive id of the cloud folder this copy's bisync session is keyed on. Set after
+    /// the first successful sync by id; a different id for the same path means the cloud folder
+    /// was deleted and recreated, which must not be synced against the old baseline.
+    pub folder_id: Option<String>,
 }
 
 /// How much of a folder's local copy is on disk: (files, bytes).
@@ -505,9 +524,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_paths_too_long_for_bisync() {
+    fn long_cloud_paths_are_fine_because_folders_sync_by_id() {
         let long = format!("/home/u/Drive/{}", "x".repeat(200));
-        assert!(norm(&long, true, &[]).unwrap_err().contains("too long"));
+        assert!(norm(&long, true, &[]).is_ok());
+        // ...but addressed by path, the same folder would overflow bisync's file names.
+        assert!(!session_fits(
+            &remote("gdrive:", &"x".repeat(200)),
+            &local_dir("x").to_string_lossy()
+        ));
+        assert!(session_fits(
+            &remote_by_id("gdrive:", "1AbC"),
+            &local_dir("x").to_string_lossy()
+        ));
+    }
+
+    #[test]
+    fn id_remote_keeps_the_options_and_drops_the_path() {
+        assert_eq!(
+            remote_by_id("gdrive:sub/", "F1"),
+            "gdrive,skip_gdocs=true,root_folder_id=F1:"
+        );
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! Resolve bisync conflicts as "newer wins, the older edit stays in the remote's version
 //! history".
 //!
-//! When a file changed on both sides between syncs, rclone 1.60's bisync renames both copies and
+//! When a file changed on both sides between syncs, bisync (asked for `--conflict-loser pathname
+//! --conflict-suffix .path`; its default names changed in rclone 1.66) renames both copies and
 //! puts both on both sides: `X..path1` is the remote's version and `X..path2` the local one. For
 //! each such pair we:
 //! 1. rename `X..path1` back to `X` on the remote, which keeps the file's identity and history;

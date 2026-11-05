@@ -17,6 +17,7 @@ mod status;
 #[cfg(test)]
 mod testutil;
 mod units;
+mod version;
 
 /// Build with `APP_ID_OVERRIDE=...` to get a side-by-side dev copy with its own panel
 /// identity and config (see `just install-dev`).
