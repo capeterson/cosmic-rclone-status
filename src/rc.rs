@@ -18,16 +18,18 @@ where
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Transfer {
-    #[serde(default)]
+    // rclone sends `null` (not a number) for a transfer that is queued but hasn't started, so
+    // every field must accept it; one that failed to parse used to be silently dropped.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub name: String,
     /// rclone reports `-1` when the size is unknown (e.g. streaming uploads).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub size: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub bytes: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub percentage: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub speed: f64,
     /// Where the transfer reads from and writes to (rclone 1.66+). A read through the mount has no
     /// destination; a VFS upload goes from the cache directory to the remote.
@@ -705,6 +707,32 @@ mod tests {
         s.uploads_queued = 2;
         s.out_of_space = true;
         assert_eq!(s.health(), Health::CacheFull);
+    }
+
+    // ---- parsing -------------------------------------------------------
+
+    #[test]
+    fn a_queued_transfer_with_null_numbers_still_parses() {
+        // As core/stats reported it during a bulk download (rclone 1.75.2).
+        let t: Transfer = serde_json::from_str(
+            r#"{"name":"Tax/2025/a.pdf","size":771323,"bytes":null,"percentage":null,
+                "speed":null,"speedAvg":null,"eta":null,"group":null,
+                "srcFs":"gdrive{eD9Xn}:","dstFs":"/home/u/.local/share/x/offline/889f"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (t.name.as_str(), t.size, t.bytes),
+            ("Tax/2025/a.pdf", 771_323, 0)
+        );
+        assert!(t.dst_fs.is_some());
+
+        // And one such transfer doesn't make the whole stats reply unreadable.
+        let stats: CoreStats = serde_json::from_str(
+            r#"{"speed":1.5,"transferring":[{"name":"a","size":1,"bytes":null},
+                {"name":"b","size":2,"bytes":2,"percentage":100,"speed":3.0}]}"#,
+        )
+        .unwrap();
+        assert_eq!(stats.transferring.len(), 2);
     }
 
     // ---- direction -----------------------------------------------------
