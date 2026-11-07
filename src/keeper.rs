@@ -543,6 +543,8 @@ struct Keeper {
     synced_print: HashMap<String, u64>,
 }
 
+const FOLDER_MISSING: &str = "The folder wasn't found in the Drive mount (moved or deleted?)";
+
 fn repair_dir() -> PathBuf {
     pin::state_dir().join("repair")
 }
@@ -842,14 +844,24 @@ impl Keeper {
     fn start_mount(&mut self, rel: &str) {
         let mp = pin::mount_point(&self.cfg, rel);
         if !mp.is_dir() {
+            // Right after login the Drive mount may not be up yet, so a missing folder says
+            // nothing; try again next cycle. Only a mounted Drive without the folder means it's gone.
+            if !rc::is_mounted(&self.cfg.mount_path) {
+                return;
+            }
             // The cloud folder is gone; mounting over nothing would hide that.
             let p = self.pin(rel);
             if p.phase != Phase::Attention {
                 p.phase = Phase::Attention;
-                p.error =
-                    Some("The folder wasn't found in the Drive mount (moved or deleted?)".into());
+                p.error = Some(FOLDER_MISSING.into());
             }
             return;
+        }
+        // The folder is back (e.g. a flag from an earlier boot-time race): clear that warning.
+        let p = self.pin(rel);
+        if p.phase == Phase::Attention && p.error.as_deref() == Some(FOLDER_MISSING) {
+            p.phase = Phase::Ready;
+            p.error = None;
         }
         if let Err(e) = units::systemctl(&["start", &units::pin_unit_name(&pin::pin_id(rel))]) {
             self.pin(rel).error = Some(format!("Couldn't mount the offline copy in place: {e}"));
